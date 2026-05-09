@@ -1,0 +1,17 @@
+# trading_data/requirements.txt
+# Core runtime dependencies
+
+# Data fetching
+yfinance>=0.2.40
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Parquet cache
+pyarrow>=14.0.0
+
+# Optional — install for specific providers:
+# kiteconnect>=4.2.0        # Zerodha Kite Connect
+# polygon-api-client>=1.12  # Polygon.io
+# ib_insync>=0.9.86         # Interactive Brokers TWS

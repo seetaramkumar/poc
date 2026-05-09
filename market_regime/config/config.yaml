@@ -1,0 +1,63 @@
+# ============================================================
+#  Market Regime Engine — Configuration
+#  All numeric thresholds live here; no magic numbers in code.
+# ============================================================
+
+indicators:
+  ema_periods:
+    fast: 20          # EMA-20 (short-term momentum)
+    mid:  50          # EMA-50 (medium-term trend)
+    slow: 200         # EMA-200 (macro trend)
+
+  adx_period: 14      # ADX / DMI look-back window
+  atr_period:  14     # ATR look-back window
+
+  volume_ma_period: 20  # Rolling average for volume
+
+thresholds:
+  # --- ADX ---
+  adx_strong_trend:   25.0   # Above → trend is strong
+  adx_weak_trend:     18.0   # Below → market is directionless
+
+  # --- ATR vs its moving average (ratio) ---
+  atr_ma_period:       20    # Periods for ATR moving average
+  atr_volatile_ratio:  1.30  # ATR / ATR_MA > this → VOLATILE
+  atr_quiet_ratio:     0.70  # ATR / ATR_MA < this → QUIET
+
+  # --- EMA slope (% change over N bars) ---
+  ema_slope_window:    5     # bars to look back for slope
+  ema_flat_threshold:  0.001 # |slope| < this → EMA is "flat"
+
+  # --- Volume ---
+  volume_surge_ratio:  1.2  # volume / vol_MA > this → volume spike
+
+scoring:
+  # Weights used by the scorer (must sum to 1.0 per regime group)
+  # Each signal contributes weight × 1.0 if true, × 0.0 if false.
+  bullish:
+    price_above_ema200: 0.30
+    ema20_above_ema50:  0.25
+    adx_strong:         0.25
+    volume_confirms:    0.20
+
+  bearish:
+    price_below_ema200: 0.30
+    ema20_below_ema50:  0.25
+    adx_strong:         0.25
+    volume_confirms:    0.20
+
+  sideways:
+    adx_weak:           0.40
+    ema20_flat:         0.30
+    ema50_flat:         0.30
+
+  volatile:
+    atr_high:           0.60
+    adx_strong:         0.40
+
+  quiet:
+    atr_low:            0.70
+    adx_weak:           0.30
+
+  # Minimum score to claim a regime (else regime = UNCERTAIN)
+  min_confidence: 0.50
