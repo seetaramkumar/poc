@@ -1,5 +1,11 @@
+# ── Regime engine core ────────────────────────────────────────────
 pandas>=2.0.0
-pandas-ta>=0.3.14b
 numpy>=1.24.0
 pyyaml>=6.0
+
+# ── Data sourcing layer (trading_data) ───────────────────────────
+yfinance>=0.2.40        # Yahoo Finance provider
+pyarrow>=14.0.0         # Parquet cache backend
+
+# ── Testing ───────────────────────────────────────────────────────
 pytest>=7.0.0

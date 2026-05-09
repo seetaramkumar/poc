@@ -4,7 +4,10 @@ indicators.py — Technical indicator computation
 Responsible for taking a raw OHLCV DataFrame and producing an
 IndicatorSnapshot for the most-recent bar (or any requested row).
 
-Dependencies: pandas, pandas-ta
+Dependencies: pandas, numpy only — no third-party TA library required.
+All indicators are implemented from their canonical definitions so the
+engine works on Python 3.11+ without any TA-library version conflicts.
+
 All periods are read from EngineConfig — no hard-coded numbers here.
 """
 
@@ -14,8 +17,8 @@ import math
 import warnings
 from typing import Optional
 
+import numpy as np
 import pandas as pd
-import pandas_ta as ta
 
 from .config_loader import EngineConfig
 from .models import IndicatorSnapshot
@@ -23,17 +26,22 @@ from .models import IndicatorSnapshot
 
 class IndicatorCalculator:
     """
-    Calculates all technical indicators required by the regime engine.
+    Calculates all technical indicators required by the regime engine
+    using pure pandas / numpy — no external TA library needed.
+
+    Indicators implemented
+    ----------------------
+    - EMA (Exponential Moving Average)
+    - ATR (Average True Range)  — Wilder smoothing
+    - ADX (Average Directional Index) — Wilder smoothing
+    - EMA slope  (% change over N bars)
+    - Volume MA  (simple rolling mean)
+    - ATR MA     (simple rolling mean of ATR)
 
     Usage
     -----
-    calc = IndicatorCalculator(config)
+    calc     = IndicatorCalculator(config)
     snapshot = calc.compute(ohlcv_df)
-
-    Parameters
-    ----------
-    config : EngineConfig
-        Loaded configuration (periods, thresholds).
     """
 
     def __init__(self, config: EngineConfig) -> None:
@@ -45,15 +53,15 @@ class IndicatorCalculator:
 
     def compute(self, df: pd.DataFrame, row_index: int = -1) -> IndicatorSnapshot:
         """
-        Compute all indicators and return a snapshot for `row_index`.
+        Compute all indicators and return a snapshot for ``row_index``.
 
         Parameters
         ----------
         df : pd.DataFrame
-            Must contain columns: open, high, low, close, volume
-            (case-insensitive; will be lower-cased internally).
+            OHLCV data with columns: open, high, low, close, volume
+            (case-insensitive).
         row_index : int
-            Which row to extract the snapshot from.  Default -1 → last row.
+            Row to snapshot.  Default -1 → most recent bar.
 
         Returns
         -------
@@ -61,104 +69,172 @@ class IndicatorCalculator:
         """
         df = self._normalise_columns(df)
         self._validate_dataframe(df)
-
         enriched = self._add_all_indicators(df)
         return self._extract_snapshot(enriched, row_index)
 
     # ──────────────────────────────────────────────────────────────
-    #  Private helpers
+    #  Private — column normalisation & validation
     # ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-        """Lower-case all column names for uniform access."""
         df = df.copy()
         df.columns = [c.lower() for c in df.columns]
         return df
 
     @staticmethod
     def _validate_dataframe(df: pd.DataFrame) -> None:
-        """Raise if mandatory OHLCV columns are missing."""
         required = {"open", "high", "low", "close", "volume"}
-        missing = required - set(df.columns)
+        missing  = required - set(df.columns)
         if missing:
             raise ValueError(f"DataFrame is missing columns: {missing}")
         if len(df) < 210:
             warnings.warn(
                 f"Only {len(df)} rows supplied. "
-                "EMA-200 needs ≥ 200 bars; some indicators may be NaN.",
+                "EMA-200 needs ≥ 200 bars; early bars will return NaN.",
                 UserWarning,
                 stacklevel=4,
             )
 
+    # ──────────────────────────────────────────────────────────────
+    #  Private — indicator implementations
+    # ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ema(series: pd.Series, period: int) -> pd.Series:
+        """
+        Standard EMA using pandas ewm (equivalent to pandas-ta ema).
+        adjust=False matches the classic recursive EMA formula.
+        """
+        return series.ewm(span=period, adjust=False).mean()
+
+    @staticmethod
+    def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+        """
+        Average True Range using Wilder smoothing (RMA).
+
+        True Range = max(H-L, |H-Cprev|, |L-Cprev|)
+        ATR        = Wilder RMA of TR over `period` bars
+        """
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low  - prev_close).abs(),
+        ], axis=1).max(axis=1)
+
+        # Wilder smoothing: equivalent to EMA with alpha = 1/period
+        return tr.ewm(alpha=1.0 / period, adjust=False).mean()
+
+    @staticmethod
+    def _adx(
+        high: pd.Series,
+        low:  pd.Series,
+        close: pd.Series,
+        period: int,
+    ) -> pd.Series:
+        """
+        Average Directional Index (Wilder, 1978).
+
+        Steps
+        -----
+        1.  +DM / -DM  (directional movement)
+        2.  Smooth with Wilder RMA → +DI / -DI
+        3.  DX  = 100 * |+DI - -DI| / (+DI + -DI)
+        4.  ADX = Wilder RMA of DX
+        """
+        alpha     = 1.0 / period
+        prev_high = high.shift(1)
+        prev_low  = low.shift(1)
+        prev_close = close.shift(1)
+
+        # True Range (reused for DI scaling)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low  - prev_close).abs(),
+        ], axis=1).max(axis=1)
+
+        # Raw directional movement
+        up   = high - prev_high
+        down = prev_low - low
+
+        plus_dm  = np.where((up > down) & (up > 0),  up,   0.0)
+        minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+
+        plus_dm_s  = pd.Series(plus_dm,  index=high.index).ewm(alpha=alpha, adjust=False).mean()
+        minus_dm_s = pd.Series(minus_dm, index=high.index).ewm(alpha=alpha, adjust=False).mean()
+        atr_s      = tr.ewm(alpha=alpha, adjust=False).mean()
+
+        # +DI / -DI as percentages
+        plus_di  = 100 * plus_dm_s  / atr_s.replace(0, np.nan)
+        minus_di = 100 * minus_dm_s / atr_s.replace(0, np.nan)
+
+        # DX then ADX
+        di_sum  = (plus_di + minus_di).replace(0, np.nan)
+        dx      = 100 * (plus_di - minus_di).abs() / di_sum
+        adx     = dx.ewm(alpha=alpha, adjust=False).mean()
+
+        return adx
+
+    # ──────────────────────────────────────────────────────────────
+    #  Private — assemble all indicator columns
+    # ──────────────────────────────────────────────────────────────
+
     def _add_all_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Append every indicator column onto a copy of df."""
-        cfg  = self.cfg
-        thr  = self.cfg.thresholds
+        cfg = self.cfg
+        thr = self.cfg.thresholds
 
         # ── EMAs ──────────────────────────────────────────────────
-        df[f"ema{cfg.ema_fast}"]  = ta.ema(df["close"], length=cfg.ema_fast)
-        df[f"ema{cfg.ema_mid}"]   = ta.ema(df["close"], length=cfg.ema_mid)
-        df[f"ema{cfg.ema_slow}"]  = ta.ema(df["close"], length=cfg.ema_slow)
+        df[f"ema{cfg.ema_fast}"] = self._ema(df["close"], cfg.ema_fast)
+        df[f"ema{cfg.ema_mid}"]  = self._ema(df["close"], cfg.ema_mid)
+        df[f"ema{cfg.ema_slow}"] = self._ema(df["close"], cfg.ema_slow)
 
         # ── EMA slopes (% change over N bars) ─────────────────────
-        slope_window = int(thr.ema_slope_window)
-        df["ema20_slope"] = (
-            df[f"ema{cfg.ema_fast}"].pct_change(slope_window)
-        )
-        df["ema50_slope"] = (
-            df[f"ema{cfg.ema_mid}"].pct_change(slope_window)
-        )
+        slope_w = int(thr.ema_slope_window)
+        df["ema20_slope"] = df[f"ema{cfg.ema_fast}"].pct_change(slope_w)
+        df["ema50_slope"] = df[f"ema{cfg.ema_mid}"].pct_change(slope_w)
 
         # ── ADX ───────────────────────────────────────────────────
-        adx_df = ta.adx(
-            df["high"], df["low"], df["close"],
-            length=cfg.adx_period
-        )
-        # pandas-ta returns a DataFrame; grab the ADX column
-        adx_col = [c for c in adx_df.columns if c.startswith("ADX_")]
-        if adx_col:
-            df["adx"] = adx_df[adx_col[0]]
-        else:
-            df["adx"] = float("nan")
+        df["adx"] = self._adx(df["high"], df["low"], df["close"], cfg.adx_period)
 
-        # ── ATR ───────────────────────────────────────────────────
-        df["atr"] = ta.atr(
-            df["high"], df["low"], df["close"],
-            length=cfg.atr_period
-        )
-        atr_ma_period = int(thr.atr_ma_period)
-        df["atr_ma"] = df["atr"].rolling(window=atr_ma_period).mean()
+        # ── ATR + ATR moving average ───────────────────────────────
+        df["atr"]    = self._atr(df["high"], df["low"], df["close"], cfg.atr_period)
+        df["atr_ma"] = df["atr"].rolling(window=int(thr.atr_ma_period)).mean()
 
         # ── Volume MA ─────────────────────────────────────────────
-        df["volume_ma"] = (
-            df["volume"].rolling(window=cfg.volume_ma_period).mean()
-        )
+        df["volume_ma"] = df["volume"].rolling(window=cfg.volume_ma_period).mean()
 
         return df
 
-    def _extract_snapshot(
-        self, df: pd.DataFrame, row_index: int
-    ) -> IndicatorSnapshot:
-        """Pull the requested row into an IndicatorSnapshot."""
+    # ──────────────────────────────────────────────────────────────
+    #  Private — snapshot extraction
+    # ──────────────────────────────────────────────────────────────
+
+    def _extract_snapshot(self, df: pd.DataFrame, row_index: int) -> IndicatorSnapshot:
         cfg = self.cfg
         row = df.iloc[row_index]
 
         def _val(col: str) -> Optional[float]:
-            """Return float or None if NaN / missing."""
             v = row.get(col, float("nan"))
-            return None if (v is None or (isinstance(v, float) and math.isnan(v))) else float(v)
+            if v is None:
+                return None
+            try:
+                f = float(v)
+                return None if math.isnan(f) else f
+            except (TypeError, ValueError):
+                return None
 
         return IndicatorSnapshot(
-            close        = float(row["close"]),
-            ema20        = _val(f"ema{cfg.ema_fast}"),
-            ema50        = _val(f"ema{cfg.ema_mid}"),
-            ema200       = _val(f"ema{cfg.ema_slow}"),
-            ema20_slope  = _val("ema20_slope"),
-            ema50_slope  = _val("ema50_slope"),
-            adx          = _val("adx"),
-            atr          = _val("atr"),
-            atr_ma       = _val("atr_ma"),
-            volume       = _val("volume"),
-            volume_ma    = _val("volume_ma"),
+            close       = float(row["close"]),
+            ema20       = _val(f"ema{cfg.ema_fast}"),
+            ema50       = _val(f"ema{cfg.ema_mid}"),
+            ema200      = _val(f"ema{cfg.ema_slow}"),
+            ema20_slope = _val("ema20_slope"),
+            ema50_slope = _val("ema50_slope"),
+            adx         = _val("adx"),
+            atr         = _val("atr"),
+            atr_ma      = _val("atr_ma"),
+            volume      = _val("volume"),
+            volume_ma   = _val("volume_ma"),
         )
