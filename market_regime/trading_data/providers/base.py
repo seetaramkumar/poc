@@ -240,13 +240,15 @@ class BaseDataProvider(ABC):
         if df is None or df.empty:
             raise SymbolNotFoundError(symbol, provider)
 
-        # 1. Normalise column names
         df = df.copy()
-        df.columns = [c.lower().strip() for c in df.columns]
 
-        # Handle yfinance MultiIndex columns  (e.g. ('Close', 'AAPL') → 'close')
+        # 1. Flatten MultiIndex columns FIRST (yfinance >= 0.2 returns MultiIndex
+        #    even for a single ticker, e.g. ('Close', '^NSEI') -> 'close').
+        #    Must happen before any .lower() call — tuples have no .lower().
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0].lower().strip() for c in df.columns]
+        else:
+            df.columns = [c.lower().strip() for c in df.columns]
 
         # 2. Select only canonical columns that are present
         available = [c for c in OHLCV_COLUMNS if c in df.columns]

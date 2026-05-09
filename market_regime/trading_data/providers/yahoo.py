@@ -121,7 +121,8 @@ class YahooFinanceProvider(BaseDataProvider):
                 interval=interval,
                 auto_adjust=self._auto_adjust,
                 progress=self._progress,
-                threads=False,        # single symbol – threading adds overhead
+                threads=False,           # single symbol – threading adds overhead
+                multi_level_index=False, # yfinance >= 1.0: flat columns for single ticker
             )
         except Exception as exc:      # noqa: BLE001
             raise ProviderError(self.name, symbol, str(exc)) from exc
