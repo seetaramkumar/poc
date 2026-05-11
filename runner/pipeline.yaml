@@ -1,0 +1,58 @@
+# ============================================================
+#  Algorithmic Trading Platform — Pipeline Configuration
+#  Controls what data is fetched, which universe to classify,
+#  and where outputs are written.
+# ============================================================
+
+# ── Data fetching ────────────────────────────────────────────
+data:
+  start_date: "2021-01-01"        # OHLCV history start (needs ≥ 220 bars for EMA-200)
+  end_date:   "today"             # "today" is resolved at runtime
+  cache_dir:  ".cache/ohlcv"
+  cache_max_age_days: 1
+  retry_attempts: 3
+
+# ── Universes ────────────────────────────────────────────────
+# Each universe has a benchmark (used for market regime + relative strength)
+# and a list of symbols.  Unknown symbols are passed through to Yahoo Finance.
+universes:
+  NIFTY500:
+    benchmark: "NIFTY50"          # canonical name → resolved by SymbolMapper
+    symbols:
+      - "RELIANCE"
+      - "TCS"
+      - "INFY"
+      - "HDFCBANK"
+      - "ICICIBANK"
+      - "WIPRO"
+      - "AXISBANK"
+      - "BAJFINANCE"
+      - "SUNPHARMA"
+      - "LTIM"
+
+  SP500:
+    benchmark: "SP500"
+    symbols:
+      - "AAPL"
+      - "MSFT"
+      - "GOOGL"
+      - "AMZN"
+      - "META"
+      - "NVDA"
+      - "TSLA"
+      - "JPM"
+      - "V"
+      - "UNH"
+
+# ── Output ───────────────────────────────────────────────────
+output:
+  root_dir:     "output"
+  persist:      true              # write parquet files after each run
+  log_dir:      "output/logs"
+  log_level:    "INFO"            # DEBUG | INFO | WARNING
+
+# ── Engine config overrides ───────────────────────────────────
+# Leave empty to use each engine's own config.yaml defaults.
+# Set a path here to override for this pipeline run.
+market_regime_config:  null       # e.g. "market_regime/config/aggressive.yaml"
+stock_regime_config:   null

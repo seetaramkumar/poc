@@ -1,0 +1,129 @@
+# ============================================================
+#  Stock Regime Engine — Configuration
+#  All numeric thresholds live here; no magic numbers in code.
+# ============================================================
+
+indicators:
+  ema_periods:
+    fast: 20          # EMA-20 (short-term momentum)
+    mid:  50          # EMA-50 (medium-term trend)
+    slow: 200         # EMA-200 (macro trend anchor)
+
+  adx_period: 14
+  atr_period: 14
+  volume_ma_period: 20
+
+  rs_period: 63       # Relative strength lookback (≈ 3 months / 1 quarter)
+  high_period: 252    # Rolling window for 52-week high proxy
+
+thresholds:
+  # ── ADX ──────────────────────────────────────────────────────
+  adx_strong_trend: 25.0    # ADX ≥ this → trend is strong
+  adx_weak_trend:   18.0    # ADX < this → market is directionless
+
+  # ── ATR ratio (ATR / ATR_MA) ─────────────────────────────────
+  atr_ma_period:        20
+  atr_volatile_ratio:   1.30  # > this → VOLATILE signal
+  atr_quiet_ratio:      0.70  # < this → QUIET signal
+  atr_compressed_ratio: 0.75  # < this → compressed / BREAKOUT_SETUP setup
+  atr_expanding_ratio:  1.00  # > this → ATR above its own average (expanding)
+
+  # ── EMA slope ────────────────────────────────────────────────
+  ema_slope_window:   5
+  ema_flat_threshold: 0.001   # |slope| < this → EMA is flat
+
+  # ── Volume ───────────────────────────────────────────────────
+  volume_surge_ratio: 1.50    # volume / vol_MA ≥ this → volume confirms move
+
+  # ── Relative Strength ────────────────────────────────────────
+  rs_positive_threshold: 1.02  # RS ≥ this → stock is outperforming benchmark
+  rs_negative_threshold: 0.98  # RS ≤ this → stock is underperforming benchmark
+  rs_strong_threshold:   1.05  # RS ≥ this → strong outperformance (momentum)
+
+  # ── Breakout Setup ───────────────────────────────────────────
+  near_high_pct: 0.03          # close within 3 % of rolling high → near high
+
+scoring:
+  # Weights must sum to 1.0 per regime group.
+  # Signal names must match fields in StockSignals.
+
+  trend_up:
+    price_above_ema200: 0.25
+    ema20_above_ema50:  0.25
+    adx_strong:         0.20
+    rs_positive:        0.20
+    volume_confirmed:   0.10
+
+  trend_down:
+    price_below_ema200: 0.25
+    ema20_below_ema50:  0.25
+    adx_strong:         0.20
+    rs_negative:        0.20
+    volume_confirmed:   0.10
+
+  range:
+    adx_weak:   0.35
+    ema20_flat: 0.25
+    ema50_flat: 0.25
+    atr_low:    0.15
+
+  momentum:
+    rs_strong:        0.35
+    adx_strong:       0.25
+    volume_confirmed: 0.25
+    atr_expanding:    0.15
+
+  breakout_setup:
+    atr_compressed:      0.35
+    price_near_52w_high: 0.35
+    volume_confirmed:    0.30
+
+  volatile:
+    atr_high:   0.60
+    adx_strong: 0.40
+
+  quiet:
+    atr_low:  0.65
+    adx_weak: 0.35
+
+  # Regime is UNCERTAIN when no candidate clears this threshold
+  min_confidence: 0.50
+
+# ── Dimensional scores (for ranking, not classification) ──────────
+# These are separate weighted sums that describe trend strength,
+# momentum, and volatility on a [0, 1] scale.
+dimensional_scores:
+  trend:
+    price_above_ema200: 0.30
+    ema20_above_ema50:  0.30
+    adx_strong:         0.25
+    rs_positive:        0.15
+
+  momentum:
+    rs_strong:        0.40
+    volume_confirmed: 0.30
+    adx_strong:       0.20
+    atr_expanding:    0.10
+
+  # Volatility score = min(atr / atr_ma, 2.0) / 2.0
+  # Computed directly from the indicator ratio — not signal-weighted.
+
+# ── Market context alignment ──────────────────────────────────────
+# Post-classification confidence adjustment.
+# When a stock's regime aligns with the market regime, multiply
+# confidence by alignment_boost; when it contradicts, by penalty.
+market_context:
+  alignment_boost:      1.10   # 10 % boost for tailwind
+  misalignment_penalty: 0.90   # 10 % haircut for headwind
+  # Market regime → stock regimes that are considered "aligned"
+  aligned_regimes:
+    BULLISH_TREND:  ["TREND_UP", "MOMENTUM", "BREAKOUT_SETUP"]
+    BEARISH_TREND:  ["TREND_DOWN", "VOLATILE"]
+    SIDEWAYS:       ["RANGE", "QUIET"]
+    VOLATILE:       ["VOLATILE", "BREAKOUT_SETUP"]
+    QUIET:          ["QUIET", "RANGE"]
+    UNCERTAIN:      []
+
+# ── Ranking ───────────────────────────────────────────────────────
+ranking:
+  top_n: 50   # Max stocks per ranked list
