@@ -1,58 +1,44 @@
 # ============================================================
-#  Algorithmic Trading Platform — Pipeline Configuration
-#  Controls what data is fetched, which universe to classify,
-#  and where outputs are written.
+#  Algo Trading Platform — Pipeline Configuration
 # ============================================================
 
 # ── Data fetching ────────────────────────────────────────────
 data:
-  start_date: "2021-01-01"        # OHLCV history start (needs ≥ 220 bars for EMA-200)
-  end_date:   "today"             # "today" is resolved at runtime
+  start_date: "2021-01-01"
+  end_date:   "today"
   cache_dir:  ".cache/ohlcv"
   cache_max_age_days: 1
   retry_attempts: 3
 
 # ── Universes ────────────────────────────────────────────────
-# Each universe has a benchmark (used for market regime + relative strength)
-# and a list of symbols.  Unknown symbols are passed through to Yahoo Finance.
+# symbol_source: path to a text file with one Yahoo Finance ticker per line.
+# Generate with:
+#   python scripts/build_nifty500.py
+#   python scripts/build_sp500.py
 universes:
   NIFTY500:
-    benchmark: "NIFTY50"          # canonical name → resolved by SymbolMapper
-    symbols:
-      - "RELIANCE"
-      - "TCS"
-      - "INFY"
-      - "HDFCBANK"
-      - "ICICIBANK"
-      - "WIPRO"
-      - "AXISBANK"
-      - "BAJFINANCE"
-      - "SUNPHARMA"
-      - "LTIM"
+    benchmark:     "^NSEI"
+    symbol_source: "data/universes/nifty500.txt"
+    exchange:      "NSE"
 
   SP500:
-    benchmark: "SP500"
-    symbols:
-      - "AAPL"
-      - "MSFT"
-      - "GOOGL"
-      - "AMZN"
-      - "META"
-      - "NVDA"
-      - "TSLA"
-      - "JPM"
-      - "V"
-      - "UNH"
+    benchmark:     "^GSPC"
+    symbol_source: "data/universes/sp500.txt"
+    exchange:      "NYSE"
+
+# ── Symbol loading options ────────────────────────────────────
+symbol_loading:
+  max_symbols:         null   # null = all; set an int (e.g. 20) for quick tests
+  skip_on_fetch_error: true
+  allow_missing_file:  false  # true = warn and skip; false = raise
 
 # ── Output ───────────────────────────────────────────────────
 output:
-  root_dir:     "output"
-  persist:      true              # write parquet files after each run
-  log_dir:      "output/logs"
-  log_level:    "INFO"            # DEBUG | INFO | WARNING
+  root_dir:  "output"
+  persist:   true
+  log_dir:   "output/logs"
+  log_level: "INFO"
 
 # ── Engine config overrides ───────────────────────────────────
-# Leave empty to use each engine's own config.yaml defaults.
-# Set a path here to override for this pipeline run.
-market_regime_config:  null       # e.g. "market_regime/config/aggressive.yaml"
-stock_regime_config:   null
+market_regime_config: null
+stock_regime_config:  null
