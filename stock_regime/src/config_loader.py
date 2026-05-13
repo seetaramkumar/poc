@@ -99,6 +99,9 @@ class StockEngineConfig:
         self.dimensional = _NS(raw["dimensional_scores"])
         self.market_ctx  = MarketContextConfig(raw["market_context"])
         self.ranking     = _NS(raw["ranking"])
+        self.filters     = _NS(raw["filters"])     if "filters"   in raw else _NS({})
+        self.quality     = _NS(raw["quality"])     if "quality"   in raw else _NS({})
+        self.stability   = _NS(raw["stability"])   if "stability" in raw else _NS({})
 
     # ── Convenience accessors (avoids deep-dot chains in hot paths) ──
 
@@ -137,3 +140,16 @@ class StockEngineConfig:
     @property
     def min_confidence(self) -> float:
         return self.scoring.min_confidence
+
+
+    @property
+    def has_filters(self) -> bool:
+        return hasattr(self, "filters")
+
+    @property
+    def has_quality(self) -> bool:
+        return hasattr(self, "quality")
+
+    @property
+    def has_stability(self) -> bool:
+        return hasattr(self, "stability")

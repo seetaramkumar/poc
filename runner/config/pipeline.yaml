@@ -4,7 +4,7 @@
 
 # ── Data fetching ────────────────────────────────────────────
 data:
-  start_date: "2018-01-01"
+  start_date: "2021-01-01"
   end_date:   "today"
   cache_dir:  ".cache/ohlcv"
   cache_max_age_days: 1

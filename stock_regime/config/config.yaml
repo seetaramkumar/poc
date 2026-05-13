@@ -127,3 +127,55 @@ market_context:
 # ── Ranking ───────────────────────────────────────────────────────
 ranking:
   top_n: 50   # Max stocks per ranked list
+
+# ── Universe Filters (Phase 1) ────────────────────────────────
+filters:
+  history:
+    min_bars:             220
+    max_gap_days:         5
+    max_stale_days:       3
+    gap_lookback_days:    90
+
+  price:
+    circuit_lookback_days:  90
+    max_circuit_days:        3
+    circuit_is_fatal:     false
+    NSE:
+      min_price_inr:     50.0
+      max_price_inr:     null
+    NYSE:
+      min_price_usd:      2.0
+      max_price_usd:     null
+    NASDAQ:
+      min_price_usd:      2.0
+      max_price_usd:     null
+
+  liquidity:
+    NSE:
+      min_adv_cr:              50.0
+      adv_period:              20
+      max_zero_volume_ratio:   0.05
+      max_volume_cv:           5.0
+    NYSE:
+      min_adv_usd_mn:          5.0
+      adv_period:              20
+      max_zero_volume_ratio:   0.05
+      max_volume_cv:           5.0
+    NASDAQ:
+      min_adv_usd_mn:          5.0
+      adv_period:              20
+      max_zero_volume_ratio:   0.05
+      max_volume_cv:           5.0
+
+  high_rejection_warning_pct: 30.0
+
+# ── Data Quality (Phase 2) ────────────────────────────────────
+quality:
+  fatal_spike_pct:    0.60
+  warn_spike_pct:     0.20
+  zero_volume_fill:   true
+
+# ── Regime Stability (Phase 3) ────────────────────────────────
+stability:
+  confirmation_bars:      3
+  uncertain_propagates:   false
