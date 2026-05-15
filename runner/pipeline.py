@@ -227,7 +227,7 @@ class AlgoTradingPipeline:
         from stock_regime.filters        import UniverseFilter
         from stock_regime.quality        import DataQualityValidator
         from stock_regime.stability      import RegimeStabiliser
-        from stock_regime.quality_engine import OpportunityQualityEngine
+        from stock_regime.quality.opportunity_quality import OpportunityQualityEngine
         from stock_regime.analytics      import RegimeAnalytics
         from stock_regime.src.models     import MarketRegimeInput
 
