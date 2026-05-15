@@ -224,12 +224,12 @@ class AlgoTradingPipeline:
         sym_cfg:       dict,
     ) -> UniverseRunResult:
 
-        from stock_regime.filters        import UniverseFilter
-        from stock_regime.quality        import DataQualityValidator
-        from stock_regime.stability      import RegimeStabiliser
-        from stock_regime.quality.opportunity_quality import OpportunityQualityEngine
-        from stock_regime.analytics      import RegimeAnalytics
-        from stock_regime.src.models     import MarketRegimeInput
+        from stock_regime.filters.universe_filter        import UniverseFilter
+        from stock_regime.quality.validator              import DataQualityValidator
+        from stock_regime.stability.stabiliser           import RegimeStabiliser
+        from stock_regime.quality.opportunity_quality    import OpportunityQualityEngine
+        from stock_regime.analytics.regime_analytics     import RegimeAnalytics
+        from stock_regime.src.models                     import MarketRegimeInput
 
         benchmark_symbol = universe_cfg["benchmark"]
         symbol_source    = universe_cfg["symbol_source"]
@@ -565,7 +565,7 @@ class AlgoTradingPipeline:
 
     def _run_analytics(self, universe: str) -> None:
         """Run regime analytics on accumulated history."""
-        from stock_regime.analytics import RegimeAnalytics
+        from stock_regime.analytics.regime_analytics import RegimeAnalytics
         history_path = (
             Path(self._cfg["output"]["root_dir"]) /
             "regime_history" / "regime_history.parquet"
