@@ -587,7 +587,7 @@ class AlgoTradingPipeline:
 
     def _build_engines(self) -> None:
         from trading_data import DataManager, DataManagerConfig
-        from market_regime.src import MarketRegimeEngine
+        from market_regime.src.engine import MarketRegimeEngine
         from stock_regime.src import StockRegimeEngine
 
         data_cfg   = self._cfg["data"]
