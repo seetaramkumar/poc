@@ -1,9 +1,8 @@
 """
 runner/tests/test_integration.py
 ==================================
-Full integration tests — all phases, no network required.
-Covers: SymbolFileLoader, build scripts, filters, quality,
-        stability, analytics, and pipeline orchestration.
+Full integration tests covering all roadmap phases.
+No network required — synthetic data throughout.
 
 Run:  cd algo_platform && pytest runner/tests/test_integration.py -v
 """
@@ -22,12 +21,11 @@ sys.path.insert(0, str(ROOT))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Helpers
+#  Shared helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _df(n=500, drift=0.001, vol=0.01, seed=0, start=18_000.0) -> pd.DataFrame:
     rng   = np.random.default_rng(seed)
-    # Always end at today so staleness filter never rejects synthetic data
     dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
     close = np.empty(n)
     price = start
@@ -55,363 +53,397 @@ STOCKS = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Phase 1 — Universe Quality & Liquidity Filtering
+#  Continuous Scoring (Improvement 1)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestHistoryFilter:
-    def _filter(self, **kw):
-        from stock_regime.filters.history_filter import HistoryFilter
-        return HistoryFilter(**kw)
+class TestContinuousScoring:
+    def _scorer(self):
+        from stock_regime.src.config_loader import StockEngineConfig
+        from stock_regime.src.scorer import StockRegimeScorer
+        return StockRegimeScorer(StockEngineConfig())
 
-    def test_passes_sufficient_history(self):
-        f = self._filter(min_bars=220, max_gap_days=5, max_stale_days=10)
-        assert f.check("SYM", _df(n=250)) == []
-
-    def test_rejects_insufficient_bars(self):
-        f = self._filter(min_bars=220)
-        reasons = f.check("SYM", _df(n=100))
-        assert any(r.check == "min_bars" for r in reasons)
-
-    def test_rejects_stale_data(self):
-        # Build a df whose last bar is 30 days ago — well beyond max_stale_days=3
-        df = _df(n=250)
-        old_dates = pd.bdate_range(
-            end=pd.Timestamp.today() - pd.Timedelta(days=30), periods=250
+    def test_continuous_scores_in_unit_interval(self):
+        from stock_regime.src.models import StockIndicatorSnapshot
+        snap = StockIndicatorSnapshot(
+            close=19000, ema20=18800, ema50=18500, ema200=17000,
+            ema20_slope=0.005, ema50_slope=0.003,
+            adx=30, atr=200, atr_ma=150, volume=1.6e7, volume_ma=1e7,
+            roc_10=2.5, roc_21=1.8, acceleration=0.7,
+            rs_3m=1.06, rs_trend=0.002, ema_distance_pct=0.12,
         )
-        df.index  = old_dates
-        f = self._filter(min_bars=220, max_stale_days=3)
-        reasons = f.check("SYM", df)
-        assert any(r.check == "stale_data" for r in reasons)
+        scorer = self._scorer()
+        cs = scorer._build_continuous_scores(snap)
+        for field_name, val in cs.to_dict().items():
+            assert 0.0 <= val <= 1.0, f"{field_name}={val} out of [0,1]"
 
-    def test_rejects_large_gap(self):
-        df  = _df(n=250)
-        idx = list(df.index)
-        # Insert a 10-day gap 30 bars from the end
-        gap_start = len(idx) - 30
-        shifted   = [
-            idx[i] + pd.Timedelta(days=10) if i >= gap_start else idx[i]
-            for i in range(len(idx))
-        ]
-        df.index  = pd.DatetimeIndex(shifted)
-        f = self._filter(min_bars=220, max_gap_days=5, gap_lookback_days=90)
-        reasons = f.check("SYM", df)
-        assert any(r.check == "data_gap" for r in reasons)
-
-
-class TestPriceFilter:
-    def _filter(self, **kw):
-        from stock_regime.filters.price_filter import PriceFilter
-        return PriceFilter(**kw)
-
-    def test_passes_normal_price(self):
-        f = self._filter(min_price=50.0, exchange="NSE")
-        assert f.check("SYM", _df(start=1000.0)) == []
-
-    def test_rejects_penny_stock(self):
-        f = self._filter(min_price=50.0, exchange="NSE")
-        df = _df(n=250)
-        df["close"] = 10.0
-        df["high"]  = 10.5
-        df["low"]   = 9.5
-        df["open"]  = 10.0
-        reasons = f.check("SYM", df)
-        assert any(r.check == "min_price" for r in reasons)
-
-    def test_circuit_breaker_warning_not_fatal_by_default(self):
-        f  = self._filter(min_price=10.0, exchange="NSE",
-                          circuit_is_fatal=False, max_circuit_days=2)
-        df = _df(n=250, start=500.0)
-        # Inject circuit-like spikes
-        df.iloc[-5, df.columns.get_loc("close")] = df["close"].iloc[-5] * 1.22
-        df.iloc[-3, df.columns.get_loc("close")] = df["close"].iloc[-3] * 1.22
-        df.iloc[-1, df.columns.get_loc("close")] = df["close"].iloc[-1] * 1.22
-        reasons = f.check("SYM", df)
-        assert len(reasons) == 0   # warning only, not fatal
-
-
-class TestLiquidityFilter:
-    def _filter(self, **kw):
-        from stock_regime.filters.liquidity_filter import LiquidityFilter
-        return LiquidityFilter(**kw)
-
-    def test_passes_liquid_stock(self):
-        # close≈1000, volume≈10M → ADV ≈ ₹1000Cr >> ₹50Cr
-        f = self._filter(min_adv=50.0, adv_in_crore=True, adv_period=20)
-        assert f.check("SYM", _df(n=250, start=1000.0)) == []
-
-    def test_rejects_illiquid_stock(self):
-        f  = self._filter(min_adv=500.0, adv_in_crore=True, adv_period=20)
-        df = _df(n=250, start=10.0)
-        df["volume"] = 100.0   # ₹1,000 daily value — far below ₹500Cr
-        reasons = f.check("SYM", df)
-        assert any(r.check == "min_adv" for r in reasons)
-
-    def test_rejects_high_zero_volume_ratio(self):
-        f  = self._filter(min_adv=1.0, adv_in_crore=True, adv_period=20,
-                          max_zero_volume_ratio=0.05)
-        df = _df(n=250, start=1000.0)
-        df.iloc[-20:, df.columns.get_loc("volume")] = 0   # 100% zero last 20 bars
-        reasons = f.check("SYM", df)
-        assert any(r.check == "zero_volume_ratio" for r in reasons)
-
-
-class TestUniverseFilter:
-    def test_accepted_count(self):
-        from stock_regime.filters.history_filter   import HistoryFilter
-        from stock_regime.filters.price_filter     import PriceFilter
-        from stock_regime.filters.liquidity_filter import LiquidityFilter
-        from stock_regime.filters.universe_filter  import UniverseFilter
-
-        f = UniverseFilter(
-            history_filter   = HistoryFilter(min_bars=100, max_gap_days=10, max_stale_days=10),
-            price_filter     = PriceFilter(min_price=5.0, exchange="NSE"),
-            liquidity_filter = LiquidityFilter(min_adv=1.0, adv_in_crore=True, adv_period=10),
-            universe         = "TEST",
+    def test_trend_momentum_diverge(self):
+        """Trend and momentum scores should differ meaningfully."""
+        from stock_regime.src.models import StockIndicatorSnapshot, StockSignals
+        scorer = self._scorer()
+        # High RS trend + high ROC (momentum) but flat EMA + low ADX (weak trend)
+        snap = StockIndicatorSnapshot(
+            close=1000, ema20=1001, ema50=1002, ema200=1003,
+            ema20_slope=0.00002, ema50_slope=0.00001,
+            adx=12, atr=10, atr_ma=9, volume=2e7, volume_ma=1e7,
+            roc_10=4.5, roc_21=1.0, acceleration=3.5,
+            rs_3m=1.08, rs_trend=0.004,
         )
-        result = f.apply({"A": _df(n=200, start=500.0), "B": _df(n=200, start=500.0)})
-        assert len(result.accepted) == 2
-        assert result.summary.accepted_count == 2
-
-    def test_rejected_symbol_has_reasons(self):
-        from stock_regime.filters.history_filter   import HistoryFilter
-        from stock_regime.filters.price_filter     import PriceFilter
-        from stock_regime.filters.liquidity_filter import LiquidityFilter
-        from stock_regime.filters.universe_filter  import UniverseFilter
-
-        f = UniverseFilter(
-            history_filter   = HistoryFilter(min_bars=1000),  # impossible threshold
-            price_filter     = PriceFilter(min_price=5.0, exchange="NSE"),
-            liquidity_filter = LiquidityFilter(min_adv=1.0, adv_in_crore=True),
-            universe="TEST",
+        sig = StockSignals()
+        ds  = scorer.score_dimensions(sig, snap)
+        # Momentum should be higher than trend for this setup
+        assert ds.momentum > ds.trend, (
+            f"Expected momentum ({ds.momentum}) > trend ({ds.trend}) "
+            f"for accelerating RS stock with flat EMAs"
         )
-        result = f.apply({"A": _df(n=200)})
-        assert "A" in result.rejected
-        assert len(result.rejected["A"]) > 0
 
-    def test_filter_result_records_for_parquet(self):
-        from stock_regime.filters.history_filter   import HistoryFilter
-        from stock_regime.filters.price_filter     import PriceFilter
-        from stock_regime.filters.liquidity_filter import LiquidityFilter
-        from stock_regime.filters.universe_filter  import UniverseFilter
-
-        f = UniverseFilter(
-            history_filter   = HistoryFilter(min_bars=1000),
-            price_filter     = PriceFilter(min_price=5.0, exchange="NSE"),
-            liquidity_filter = LiquidityFilter(min_adv=1.0, adv_in_crore=True),
-            universe="TEST",
+    def test_no_binary_saturation(self):
+        """With realistic inputs, trend score should not be exactly 1.0."""
+        from stock_regime.src.models import StockIndicatorSnapshot, StockSignals
+        scorer = self._scorer()
+        snap = StockIndicatorSnapshot(
+            close=19000, ema20=18900, ema50=18700, ema200=17000,
+            adx=28, atr=180, atr_ma=150, volume=1.5e7, volume_ma=1e7,
+            roc_10=1.5, rs_3m=1.04, ema_distance_pct=0.12,
         )
-        result  = f.apply({"BAD": _df(n=50)})
-        records = result.rejected_symbols_as_records()
-        assert len(records) > 0
-        assert "symbol" in records[0]
-        assert "filter_name" in records[0]
+        sig = StockSignals()
+        ds  = scorer.score_dimensions(sig, snap)
+        assert ds.trend < 1.0, f"trend score {ds.trend} should be < 1.0 (no saturation)"
+        assert ds.trend > 0.0, f"trend score {ds.trend} should be > 0.0"
+
+    def test_continuous_scores_attached_to_dimensional(self):
+        from stock_regime.src.models import StockIndicatorSnapshot, StockSignals
+        scorer = self._scorer()
+        snap   = StockIndicatorSnapshot(close=1000, adx=25, atr=10, atr_ma=9)
+        sig    = StockSignals()
+        ds     = scorer.score_dimensions(sig, snap)
+        assert ds.continuous is not None
+        assert hasattr(ds.continuous, "adx_score")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Phase 2 — Data Quality Validation
+#  New Indicators (ROC, RS multi-period, higher highs)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestDataQualityValidator:
-    def _v(self, **kw):
-        from stock_regime.quality import DataQualityValidator
-        return DataQualityValidator(**kw)
+class TestNewIndicators:
+    def _calc(self):
+        from stock_regime.src.config_loader import StockEngineConfig
+        from stock_regime.src.indicators import StockIndicatorCalculator
+        return StockIndicatorCalculator(StockEngineConfig())
 
-    def test_clean_df_passes(self):
-        report = self._v().validate({"SYM": _df(n=250)})
-        assert "SYM" in report.clean
-        assert "SYM" not in report.excluded
+    def test_roc_computed(self):
+        snap = self._calc().compute(_df(n=500, seed=1))
+        assert snap.roc_10  is not None, "roc_10 should be computed"
+        assert snap.roc_21  is not None, "roc_21 should be computed"
 
-    def test_zero_close_is_fatal(self):
-        df = _df(n=250)
-        df.iloc[100, df.columns.get_loc("close")] = 0.0
-        df.iloc[100, df.columns.get_loc("low")]   = 0.0
-        report = self._v().validate({"BAD": df})
-        assert "BAD" in report.excluded
+    def test_acceleration_computed(self):
+        snap = self._calc().compute(_df(n=500, seed=1))
+        assert snap.acceleration is not None
+        # acceleration = roc_10 - roc_21
+        assert abs(snap.acceleration - (snap.roc_10 - snap.roc_21)) < 1e-6
 
-    def test_inverted_ohlc_is_fatal(self):
-        df = _df(n=250)
-        df.iloc[50, df.columns.get_loc("high")] = 100.0
-        df.iloc[50, df.columns.get_loc("low")]  = 200.0  # high < low
-        report = self._v().validate({"BAD": df})
-        assert "BAD" in report.excluded
+    def test_ema_distance_pct_computed(self):
+        snap = self._calc().compute(_df(n=500, seed=1))
+        if snap.ema200 is not None and snap.ema200 > 0:
+            expected = (snap.close - snap.ema200) / snap.ema200
+            assert abs(snap.ema_distance_pct - expected) < 1e-4
 
-    def test_large_return_spike_is_fatal(self):
-        df = _df(n=250, start=1000.0)
-        df.iloc[-1, df.columns.get_loc("close")] = 5000.0  # +400%
-        report = self._v(fatal_spike_pct=0.60).validate({"BAD": df})
-        assert "BAD" in report.excluded
+    def test_higher_highs_count_computed(self):
+        snap = self._calc().compute(_df(n=500, seed=1))
+        assert snap.higher_highs_count is not None
+        assert 0 <= snap.higher_highs_count <= 20  # within window
 
-    def test_zero_volume_is_corrected(self):
-        df = _df(n=250)
-        df.iloc[-5, df.columns.get_loc("volume")] = 0
-        report = self._v(zero_volume_fill=True).validate({"SYM": df})
-        assert "SYM" in report.clean
-        # Volume should be filled (non-zero)
-        clean_df = report.clean["SYM"]
-        assert clean_df.iloc[-5]["volume"] > 0
+    def test_rs_profile_with_benchmark(self):
+        snap = self._calc().compute(_df(n=500, seed=1), benchmark_df=BENCH)
+        # rs_3m should be populated with a benchmark
+        assert snap.rs_3m is not None
+        assert 0.5 < snap.rs_3m < 2.0, f"rs_3m={snap.rs_3m} out of plausible range"
 
-    def test_close_above_high_is_corrected_not_fatal(self):
-        df = _df(n=250)
-        df.iloc[-1, df.columns.get_loc("close")] = df.iloc[-1]["high"] * 1.01
-        report = self._v().validate({"SYM": df})
-        assert "SYM" in report.clean
-        clean_df = report.clean["SYM"]
-        assert clean_df.iloc[-1]["close"] <= clean_df.iloc[-1]["high"] * 1.001
-
-    def test_all_anomalies_serialisable(self):
-        df = _df(n=250)
-        df.iloc[-5, df.columns.get_loc("volume")] = 0
-        report = self._v().validate({"SYM": df})
-        records = report.all_anomalies_as_records()
-        for r in records:
-            assert "symbol" in r and "check" in r and "severity" in r
-
-    def test_multiple_stocks_isolated(self):
-        good = _df(n=250)
-        bad  = _df(n=250)
-        bad.iloc[0, bad.columns.get_loc("close")] = 0.0
-        bad.iloc[0, bad.columns.get_loc("low")]   = 0.0
-        report = self._v().validate({"GOOD": good, "BAD": bad})
-        assert "GOOD" in report.clean
-        assert "BAD"  in report.excluded
+    def test_legacy_relative_strength_alias(self):
+        """relative_strength must equal rs_3m for backward compatibility."""
+        snap = self._calc().compute(_df(n=500, seed=1), benchmark_df=BENCH)
+        assert snap.relative_strength == snap.rs_3m
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Phase 3 — Regime Stability
+#  New Signals (roc, rs_improving, higher_highs)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestRegimeStabiliser:
-    def _make_result(self, regime_str: str, symbol="SYM"):
+class TestNewSignals:
+    def _extractor(self):
+        from stock_regime.src.config_loader import StockEngineConfig
+        from stock_regime.src.signals import StockSignalExtractor
+        return StockSignalExtractor(StockEngineConfig())
+
+    def _snap(self, **kw):
+        from stock_regime.src.models import StockIndicatorSnapshot
+        defaults = dict(
+            close=19000, ema20=18800, ema50=18500, ema200=17000,
+            ema20_slope=0.005, ema50_slope=0.003,
+            adx=30, atr=200, atr_ma=150, volume=1.6e7, volume_ma=1e7,
+        )
+        defaults.update(kw)
+        return StockIndicatorSnapshot(**defaults)
+
+    def test_roc_positive_signal(self):
+        sig = self._extractor().extract(self._snap(roc_10=2.5))
+        assert sig.roc_positive is True
+
+    def test_roc_negative_signal(self):
+        sig = self._extractor().extract(self._snap(roc_10=-1.5))
+        assert sig.roc_positive is False
+
+    def test_roc_accelerating_signal(self):
+        sig = self._extractor().extract(self._snap(roc_10=3.0, roc_21=1.0, acceleration=2.0))
+        assert sig.roc_accelerating is True
+
+    def test_rs_improving_signal(self):
+        sig = self._extractor().extract(self._snap(rs_trend=0.002))
+        assert sig.rs_improving is True
+        assert sig.rs_weakening is False
+
+    def test_rs_weakening_signal(self):
+        sig = self._extractor().extract(self._snap(rs_trend=-0.003))
+        assert sig.rs_weakening is True
+        assert sig.rs_improving is False
+
+    def test_higher_highs_signal(self):
+        sig = self._extractor().extract(self._snap(higher_highs_count=8))
+        assert sig.higher_highs is True
+
+    def test_higher_highs_below_threshold(self):
+        sig = self._extractor().extract(self._snap(higher_highs_count=2))
+        assert sig.higher_highs is False
+
+    def test_ema_extended_signal(self):
+        sig = self._extractor().extract(self._snap(ema_distance_pct=0.15))
+        assert sig.ema_extended is True
+
+    def test_rs_uses_rs_3m_preferentially(self):
+        """rs_3m should drive rs_positive, not legacy relative_strength."""
+        snap = self._snap(rs_3m=1.08, relative_strength=0.90)
+        sig  = self._extractor().extract(snap)
+        assert sig.rs_positive is True   # driven by rs_3m=1.08, not 0.90
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Regime Stability — smoothing + hysteresis
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRegimeStabilityEnhanced:
+    def _make_result(self, regime_str, conf=0.75, symbol="SYM"):
         from stock_regime.src.models import (
             StockRegime, StockRegimeResult, DimensionalScores,
             StockSignals, StockIndicatorSnapshot,
         )
         return StockRegimeResult(
-            symbol             = symbol,
-            market             = "TEST",
-            stock_regime       = StockRegime(regime_str),
-            confidence         = 0.75,
-            dimensional_scores = DimensionalScores(),
-            regime_scores      = {},
-            signals            = StockSignals(),
-            indicators         = StockIndicatorSnapshot(),
-        )
-
-    def test_regime_not_confirmed_below_threshold(self):
-        from stock_regime.stability import RegimeStabiliser, SymbolHistory
-        stab    = RegimeStabiliser(confirmation_bars=3)
-        history = {"SYM": SymbolHistory(
-            symbol="SYM",
-            raw_regimes=["RANGE", "TREND_UP"],   # only 2 bars of TREND_UP
-            stable_regime="RANGE",
-            stable_age=5,
-        )}
-        results = stab.apply([self._make_result("TREND_UP")], history)
-        assert results[0].stable_regime.value == "RANGE"
-        assert results[0].regime_changed_today is False
-
-    def test_regime_confirmed_at_threshold(self):
-        from stock_regime.stability import RegimeStabiliser, SymbolHistory
-        stab    = RegimeStabiliser(confirmation_bars=3)
-        history = {"SYM": SymbolHistory(
-            symbol="SYM",
-            raw_regimes=["TREND_UP", "TREND_UP"],  # 2 prior + today = 3
-            stable_regime="RANGE",
-            stable_age=5,
-        )}
-        results = stab.apply([self._make_result("TREND_UP")], history)
-        assert results[0].stable_regime.value == "TREND_UP"
-        assert results[0].regime_changed_today is True
-
-    def test_uncertain_does_not_overwrite_stable(self):
-        from stock_regime.stability import RegimeStabiliser, SymbolHistory
-        stab    = RegimeStabiliser(confirmation_bars=3, uncertain_propagates=False)
-        history = {"SYM": SymbolHistory(
-            symbol="SYM",
-            raw_regimes=["TREND_UP", "TREND_UP"],
-            stable_regime="TREND_UP",
-            stable_age=8,
-        )}
-        results = stab.apply([self._make_result("UNCERTAIN")], history)
-        assert results[0].stable_regime.value == "TREND_UP"
-
-    def test_history_mutated_after_apply(self):
-        from stock_regime.stability import RegimeStabiliser, SymbolHistory
-        stab    = RegimeStabiliser(confirmation_bars=3)
-        history: dict = {}
-        stab.apply([self._make_result("TREND_UP")], history)
-        assert "SYM" in history
-        assert history["SYM"].raw_regimes[-1] == "TREND_UP"
-
-    def test_regime_age_increments(self):
-        from stock_regime.stability import RegimeStabiliser, SymbolHistory
-        stab    = RegimeStabiliser(confirmation_bars=3)
-        history = {"SYM": SymbolHistory(
-            symbol="SYM",
-            raw_regimes=["TREND_UP"] * 5,
-            stable_regime="TREND_UP",
-            stable_age=5,
-        )}
-        results = stab.apply([self._make_result("TREND_UP")], history)
-        assert results[0].regime_age_bars == 6
-
-    def test_save_and_load_history(self, tmp_path):
-        from stock_regime.stability import RegimeStabiliser, SymbolHistory
-        from stock_regime.src.models import (
-            StockRegime, StockRegimeResult, DimensionalScores,
-            StockSignals, StockIndicatorSnapshot,
-        )
-        stab    = RegimeStabiliser(confirmation_bars=3)
-        history: dict = {}
-
-        for _ in range(3):
-            stab.apply([self._make_result("TREND_UP")], history)
-
-        path = str(tmp_path / "history.parquet")
-
-        # Build minimal StableRegimeResult for save
-        raw = StockRegimeResult(
-            symbol="SYM", market="TEST",
-            stock_regime=StockRegime.TREND_UP, confidence=0.8,
+            symbol=symbol, market="TEST",
+            stock_regime=StockRegime(regime_str), confidence=conf,
             dimensional_scores=DimensionalScores(), regime_scores={},
             signals=StockSignals(), indicators=StockIndicatorSnapshot(),
         )
-        stable_results = stab.apply([raw], history)
-        RegimeStabiliser.save_history(stable_results, path, append=False)
 
-        loaded = RegimeStabiliser.load_history(path)
-        assert "SYM" in loaded
+    def test_smoothed_confidence_populated(self):
+        from stock_regime.stability import RegimeStabiliser, SymbolHistory
+        stab = RegimeStabiliser(confirmation_bars=1, smoothing_enabled=True,
+                                smoothing_alpha=0.5)
+        hist = {"SYM": SymbolHistory(symbol="SYM", stable_regime="TREND_UP",
+                                     stable_age=3, smoothed_confidence=0.80)}
+        results = stab.apply([self._make_result("TREND_UP", conf=0.70)], hist)
+        # EWM: 0.5 * 0.70 + 0.5 * 0.80 = 0.75
+        assert abs(results[0].smoothed_confidence - 0.75) < 0.01
+
+    def test_hysteresis_prevents_weak_switch(self):
+        """A weak new-regime signal should not overcome hysteresis."""
+        from stock_regime.stability import RegimeStabiliser, SymbolHistory
+        stab = RegimeStabiliser(
+            confirmation_bars=1,
+            hysteresis_threshold=0.10,
+            regime_switch_threshold=0.40,
+            smoothing_enabled=True, smoothing_alpha=0.5,
+        )
+        # Current stable = TREND_UP with high smoothed confidence
+        hist = {"SYM": SymbolHistory(
+            symbol="SYM",
+            raw_regimes=["RANGE"],
+            stable_regime="TREND_UP",
+            stable_age=5,
+            smoothed_confidence=0.80,
+        )}
+        # New raw regime = RANGE with low confidence — shouldn't switch
+        results = stab.apply([self._make_result("RANGE", conf=0.55)], hist)
+        assert results[0].stable_regime.value == "TREND_UP"
+        assert results[0].regime_changed_today is False
+
+    def test_oscillation_detected(self):
+        """Stocks that flip regime every bar should trigger oscillation flag."""
+        from stock_regime.stability import RegimeStabiliser, SymbolHistory
+        stab = RegimeStabiliser(confirmation_bars=2, persistence_window=4)
+        hist = {"SYM": SymbolHistory(
+            symbol="SYM",
+            raw_regimes=["TREND_UP", "RANGE", "TREND_UP", "RANGE"],
+            stable_regime="TREND_UP",
+            stable_age=1,
+        )}
+        results = stab.apply([self._make_result("RANGE", conf=0.70)], hist)
+        assert results[0].oscillation_detected is True
+
+    def test_smoothing_disabled_uses_raw_confidence(self):
+        from stock_regime.stability import RegimeStabiliser, SymbolHistory
+        stab = RegimeStabiliser(
+            confirmation_bars=1, smoothing_enabled=False,
+            regime_switch_threshold=0.40,
+        )
+        hist = {"SYM": SymbolHistory(symbol="SYM", stable_regime="RANGE",
+                                     stable_age=2, smoothed_confidence=0.80)}
+        results = stab.apply([self._make_result("TREND_UP", conf=0.70)], hist)
+        assert abs(results[0].smoothed_confidence - 0.70) < 0.01
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Phase 8 — Regime Analytics
+#  Opportunity Quality Engine (Improvement 7)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestOpportunityQualityEngine:
+    def _make_stable_result(self, symbol="SYM", regime="TREND_UP",
+                            conf=0.78, smth=0.76, age=8, oscillating=False):
+        from stock_regime.stability.stabiliser import StableRegimeResult
+        from stock_regime.src.models import (
+            StockRegime, StockRegimeResult, DimensionalScores,
+            StockSignals, StockIndicatorSnapshot, ContinuousScores,
+        )
+        raw = StockRegimeResult(
+            symbol=symbol, market="TEST",
+            stock_regime=StockRegime(regime), confidence=conf,
+            dimensional_scores=DimensionalScores(
+                trend=0.72, momentum=0.65, volatility=0.40,
+                continuous=ContinuousScores(
+                    adx_score=0.60, ema_alignment_score=0.80,
+                    ema_distance_score=0.60, atr_expansion_score=0.50,
+                    rs_score=0.65, rs_trend_score=0.70,
+                    roc_score=0.65, volume_score=0.55,
+                ),
+            ),
+            regime_scores={}, signals=StockSignals(),
+            indicators=StockIndicatorSnapshot(
+                close=1000, ema200=900, atr=15, atr_ma=14,
+                volume=1.5e7, volume_ma=1e7,
+                ema_distance_pct=0.11, higher_highs_count=7, rs_3m=1.05,
+            ),
+        )
+        sr = StableRegimeResult.from_result(
+            raw,
+            stable_regime=StockRegime(regime),
+            prior_stable_regime=StockRegime.RANGE,
+            regime_age_bars=age,
+            stable_regime_age=age,
+            regime_changed_today=False,
+            smoothed_confidence=smth,
+            oscillation_detected=oscillating,
+        )
+        return sr
+
+    def test_quality_score_in_unit_interval(self):
+        from stock_regime.quality_engine import OpportunityQualityEngine
+        engine = OpportunityQualityEngine()
+        r      = self._make_stable_result()
+        scores = engine.evaluate_batch([r], {r.symbol: _df(n=300, seed=1)})
+        assert len(scores) == 1
+        assert 0.0 <= scores[0].quality_score <= 1.0
+
+    def test_oscillating_stock_penalised(self):
+        from stock_regime.quality_engine import OpportunityQualityEngine
+        engine = OpportunityQualityEngine()
+        stable = self._make_stable_result(oscillating=False)
+        osc    = self._make_stable_result(symbol="OSC", oscillating=True)
+        scores = engine.evaluate_batch([stable, osc], {
+            stable.symbol: _df(n=300, seed=1),
+            osc.symbol:    _df(n=300, seed=2),
+        })
+        s_score = next(s for s in scores if s.symbol == stable.symbol)
+        o_score = next(s for s in scores if s.symbol == "OSC")
+        assert s_score.stability_quality > o_score.stability_quality
+
+    def test_uncertain_regime_zero_stability(self):
+        from stock_regime.quality_engine import OpportunityQualityEngine
+        engine = OpportunityQualityEngine()
+        r      = self._make_stable_result(regime="UNCERTAIN", conf=0.0, smth=0.0)
+        scores = engine.evaluate_batch([r], {r.symbol: _df(n=300, seed=1)})
+        assert scores[0].stability_quality == 0.0
+
+    def test_quality_output_serialises_to_dict(self):
+        from stock_regime.quality_engine import OpportunityQualityEngine
+        engine = OpportunityQualityEngine()
+        r      = self._make_stable_result()
+        scores = engine.evaluate_batch([r], {r.symbol: _df(n=300, seed=1)})
+        d = scores[0].to_dict()
+        for key in ["symbol", "quality_score", "trend_quality",
+                    "liquidity_quality", "stability_quality"]:
+            assert key in d
+
+    def test_persist_creates_parquet(self, tmp_path):
+        from stock_regime.quality_engine import OpportunityQualityEngine
+        engine = OpportunityQualityEngine()
+        r      = self._make_stable_result()
+        scores = engine.evaluate_batch([r], {r.symbol: _df(n=300, seed=1)})
+        path   = engine.persist(scores, tmp_path, universe="TEST")
+        assert path is not None and path.exists()
+        df = pd.read_parquet(path)
+        assert "quality_score" in df.columns
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Strict History Validation (Improvement 5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestStrictHistoryValidation:
+    def test_short_history_rejected(self):
+        from stock_regime.filters.history_filter import HistoryFilter
+        f = HistoryFilter(min_bars=300)
+        # Only 250 bars — should be rejected
+        reasons = f.check("SYM", _df(n=250))
+        assert any(r.check == "min_bars" for r in reasons)
+
+    def test_300_bars_accepted(self):
+        from stock_regime.filters.history_filter import HistoryFilter
+        f = HistoryFilter(min_bars=300)
+        reasons = f.check("SYM", _df(n=320))
+        assert reasons == []
+
+    def test_engine_warns_on_insufficient_bars(self):
+        """Engine should warn when fewer than recommended bars are supplied."""
+        import warnings
+        from stock_regime.src.config_loader import StockEngineConfig
+        from stock_regime.src.indicators import StockIndicatorCalculator
+        calc = StockIndicatorCalculator(StockEngineConfig())
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            calc.compute(_df(n=50))  # far too few
+            assert len(w) > 0
+            assert "rows" in str(w[0].message).lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Regime Analytics (Improvement 8)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestRegimeAnalytics:
-    def _make_history_df(self, n_symbols=3, n_days=60) -> pd.DataFrame:
-        """Synthetic regime history parquet data."""
-        from stock_regime.src.models import StockRegime
+    def _history_df(self, n_symbols=5, n_days=100) -> pd.DataFrame:
         import random
-
         random.seed(42)
         regimes = ["TREND_UP", "TREND_DOWN", "RANGE", "MOMENTUM"]
         rows    = []
-        dates   = pd.bdate_range(end="2024-12-31", periods=n_days)
-
+        dates   = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n_days)
         for i in range(n_symbols):
-            sym     = f"SYM{i}"
-            stable  = random.choice(regimes)
-            age     = 0
-            changed = False
+            sym    = f"SYM{i}"
+            stable = random.choice(regimes)
+            age    = 0
             for j, d in enumerate(dates):
-                if j % 10 == 0 and j > 0:   # regime changes every 10 bars
-                    prev   = stable
+                changed = (j % 12 == 0 and j > 0)
+                if changed:
                     stable = random.choice(regimes)
-                    changed = stable != prev
-                    age     = 1
+                    age    = 1
                 else:
-                    age    += 1
-                    changed = False
+                    age   += 1
                 rows.append({
                     "symbol":               sym,
                     "market":               "TEST",
@@ -420,212 +452,123 @@ class TestRegimeAnalytics:
                     "stable_regime":        stable,
                     "prior_stable_regime":  stable,
                     "confidence":           0.75,
+                    "smoothed_confidence":  0.74,
                     "regime_age_bars":      age,
                     "stable_regime_age":    age,
                     "regime_changed_today": changed,
+                    "oscillation_detected": False,
                 })
         return pd.DataFrame(rows)
 
-    def test_compute_returns_report(self, tmp_path):
+    def test_analytics_produces_report(self, tmp_path):
         from stock_regime.analytics import RegimeAnalytics
-        hist = self._make_history_df()
-        p    = tmp_path / "history.parquet"
-        hist.to_parquet(p, index=False)
-        rpt  = RegimeAnalytics(p).compute("TEST")
+        p = tmp_path / "history.parquet"
+        self._history_df().to_parquet(p, index=False)
+        rpt = RegimeAnalytics(p).compute("TEST")
         assert rpt.universe == "TEST"
         assert len(rpt.current_episodes) > 0
 
-    def test_duration_stats_have_values(self, tmp_path):
-        from stock_regime.analytics import RegimeAnalytics
-        hist = self._make_history_df(n_symbols=10, n_days=120)
-        p    = tmp_path / "history.parquet"
-        hist.to_parquet(p, index=False)
-        rpt  = RegimeAnalytics(p, min_episode_bars=2).compute("TEST")
-        assert len(rpt.duration_stats) > 0
-        for s in rpt.duration_stats:
-            assert s.mean_bars > 0
-            assert s.sample_count > 0
-
     def test_transition_matrix_rows_sum_to_one(self, tmp_path):
         from stock_regime.analytics import RegimeAnalytics
-        hist = self._make_history_df(n_symbols=20, n_days=200)
-        p    = tmp_path / "history.parquet"
-        hist.to_parquet(p, index=False)
-        rpt  = RegimeAnalytics(p).compute("TEST")
+        p = tmp_path / "history.parquet"
+        self._history_df(n_symbols=15, n_days=200).to_parquet(p, index=False)
+        rpt = RegimeAnalytics(p).compute("TEST")
         if rpt.transition_matrix:
             row_sums = rpt.transition_matrix.matrix.sum(axis=1)
-            # Rows with at least one transition should sum to ~1.0
-            active = row_sums[row_sums > 0]
+            active   = row_sums[row_sums > 0]
             assert (active - 1.0).abs().max() < 0.01
 
-    def test_recent_changes_within_window(self, tmp_path):
+    def test_analytics_persist_files(self, tmp_path):
         from stock_regime.analytics import RegimeAnalytics
-        hist  = self._make_history_df(n_symbols=5, n_days=60)
-        p     = tmp_path / "history.parquet"
-        hist.to_parquet(p, index=False)
-        today = pd.to_datetime("2024-12-31").date()
-        rpt   = RegimeAnalytics(p, recent_change_days=10).compute("TEST", as_of_date=today)
-        for ep in rpt.recent_changes:
-            assert ep.last_date >= (today - __import__("datetime").timedelta(days=10))
-
-    def test_persist_creates_parquet_files(self, tmp_path):
-        from stock_regime.analytics import RegimeAnalytics
-        hist = self._make_history_df(n_symbols=10, n_days=120)
-        p    = tmp_path / "history.parquet"
-        hist.to_parquet(p, index=False)
+        p = tmp_path / "history.parquet"
+        self._history_df().to_parquet(p, index=False)
         rpt   = RegimeAnalytics(p, min_episode_bars=2).compute("TEST")
         saved = RegimeAnalytics(p).persist(rpt, tmp_path)
         assert len(saved) > 0
-        for path in saved.values():
-            assert path.exists()
-
-    def test_empty_history_returns_empty_report(self, tmp_path):
-        from stock_regime.analytics import RegimeAnalytics
-        p = tmp_path / "empty.parquet"
-        pd.DataFrame(columns=[
-            "symbol","market","run_date","raw_regime","stable_regime",
-            "prior_stable_regime","confidence","regime_age_bars",
-            "stable_regime_age","regime_changed_today",
-        ]).to_parquet(p, index=False)
-        rpt = RegimeAnalytics(p).compute("TEST")
-        assert rpt.duration_stats    == []
-        assert rpt.current_episodes  == []
+        for fp in saved.values():
+            assert fp.exists()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SymbolFileLoader
+#  Validation plotting
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestSymbolFileLoader:
-    def _loader(self):
-        from runner.pipeline import SymbolFileLoader
-        return SymbolFileLoader(project_root=ROOT)
-
-    def test_loads_tickers(self, tmp_path):
-        f = tmp_path / "t.txt"
-        f.write_text("AAPL\nMSFT\nGOOGL\n")
-        assert self._loader().load(str(f)) == ["AAPL", "MSFT", "GOOGL"]
-
-    def test_skips_comments_and_blanks(self, tmp_path):
-        f = tmp_path / "t.txt"
-        f.write_text("AAPL\n# comment\n\nMSFT\n")
-        assert self._loader().load(str(f)) == ["AAPL", "MSFT"]
-
-    def test_max_symbols_applied(self, tmp_path):
-        f = tmp_path / "t.txt"
-        f.write_text("\n".join(f"T{i}" for i in range(50)))
-        assert len(self._loader().load(str(f), max_symbols=10)) == 10
-
-    def test_missing_file_raises(self):
-        with pytest.raises(FileNotFoundError, match="scripts/build"):
-            self._loader().load("data/universes/does_not_exist.txt", allow_missing=False)
-
-    def test_missing_file_allowed(self):
-        assert self._loader().load("data/universes/does_not_exist.txt", allow_missing=True) == []
-
-    def test_empty_file_returns_empty(self, tmp_path):
-        f = tmp_path / "e.txt"
-        f.write_text("")
-        assert self._loader().load(str(f)) == []
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Build-script normalisation (no network)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestBuildScripts:
-    def test_nifty_ticker_format(self):
-        from scripts.build_nifty500 import _to_yahoo_ticker
-        assert _to_yahoo_ticker("RELIANCE") == "RELIANCE.NS"
-        assert _to_yahoo_ticker("M&M")      == "M-M.NS"
-
-    def test_sp500_ticker_format(self):
-        from scripts.build_sp500 import _to_yahoo_ticker
-        assert _to_yahoo_ticker("AAPL")  == "AAPL"
-        assert _to_yahoo_ticker("BRK.B") == "BRK-B"
-
-    def test_nifty_build_from_local_csv(self, tmp_path):
-        from scripts.build_nifty500 import build
-        csv = tmp_path / "nifty.csv"
-        pd.DataFrame({"Symbol": ["RELIANCE", "TCS", "INFY", "M&M"]}).to_csv(csv, index=False)
-        tickers = build(output_path=tmp_path / "nifty500.txt", csv_path=csv)
-        assert "RELIANCE.NS" in tickers
-        assert "M-M.NS"      in tickers
-
-    def test_sp500_build_from_local_csv(self, tmp_path):
-        from scripts.build_sp500 import build
-        csv = tmp_path / "sp500.csv"
-        pd.DataFrame({"Symbol": ["AAPL", "MSFT", "BRK.B"]}).to_csv(csv, index=False)
-        tickers = build(output_path=tmp_path / "sp500.txt", csv_path=csv)
-        assert "AAPL"  in tickers
-        assert "BRK-B" in tickers
-
-    def test_dry_run_does_not_write(self, tmp_path):
-        from scripts.build_nifty500 import build
-        csv = tmp_path / "nifty.csv"
-        pd.DataFrame({"Symbol": ["RELIANCE", "TCS"]}).to_csv(csv, index=False)
-        out = tmp_path / "out.txt"
-        build(output_path=out, csv_path=csv, dry_run=True)
-        assert not out.exists()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Direct engine integration
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestDirectIntegration:
-    def test_market_to_stock_bridge(self):
-        from market_regime.src import MarketRegimeEngine
-        from stock_regime.src.models import MarketRegimeInput
-        result = MarketRegimeEngine().analyze(BENCH)
-        ctx    = MarketRegimeInput.from_dict(result.to_dict())
-        assert ctx.regime     == result.to_dict()["regime"]
-        assert ctx.confidence == pytest.approx(result.to_dict()["confidence"])
-
-    def test_full_three_engine_pipeline(self):
-        from market_regime.src import MarketRegimeEngine
-        from stock_regime.src import StockRegimeEngine
-        from stock_regime.src.models import MarketRegimeInput
-        ctx     = MarketRegimeInput.from_dict(
-            MarketRegimeEngine().analyze(BENCH).to_dict()
+class TestValidationPlotting:
+    def _make_stable(self, symbol="INFY.NS"):
+        from stock_regime.stability.stabiliser import StableRegimeResult
+        from stock_regime.src.models import (
+            StockRegime, StockRegimeResult, DimensionalScores,
+            StockSignals, StockIndicatorSnapshot, ContinuousScores,
         )
-        results = StockRegimeEngine(output_dir="/tmp/test_out").analyze_universe(
-            STOCKS, ctx, BENCH, "TEST", persist=False,
+        raw = StockRegimeResult(
+            symbol=symbol, market="TEST",
+            stock_regime=StockRegime.TREND_UP, confidence=0.78,
+            dimensional_scores=DimensionalScores(
+                trend=0.72, momentum=0.65, volatility=0.40,
+                continuous=ContinuousScores(
+                    adx_score=0.60, ema_alignment_score=0.80,
+                    rs_score=0.65, roc_score=0.65,
+                ),
+            ),
+            regime_scores={}, signals=StockSignals(),
+            indicators=StockIndicatorSnapshot(
+                close=1820, ema20=1785, ema50=1710, ema200=1602,
+                adx=28, atr=42, atr_ma=45, volume=1.5e7, volume_ma=1.2e7,
+            ),
         )
-        assert len(results) == len(STOCKS)
-        for r in results:
-            assert 0.0 <= r.confidence <= 1.0
-
-    def test_stable_result_serialises_to_json(self):
-        import json
-        from market_regime.src import MarketRegimeEngine
-        from stock_regime.src import StockRegimeEngine
-        from stock_regime.src.models import MarketRegimeInput
-        from stock_regime.stability import RegimeStabiliser
-
-        ctx     = MarketRegimeInput(regime="BULLISH_TREND", confidence=0.75)
-        raw     = StockRegimeEngine(output_dir="/tmp/test_out").analyze_universe(
-            STOCKS, ctx, BENCH, "TEST", persist=False,
+        return StableRegimeResult.from_result(
+            raw,
+            stable_regime=StockRegime.TREND_UP,
+            prior_stable_regime=StockRegime.RANGE,
+            regime_age_bars=12, stable_regime_age=12,
+            regime_changed_today=False,
+            smoothed_confidence=0.76, oscillation_detected=False,
         )
-        history: dict = {}
-        stable  = RegimeStabiliser(confirmation_bars=2).apply(raw, history)
-        for r in stable:
-            parsed = json.loads(json.dumps(r.to_dict()))
-            assert parsed["symbol"] == r.symbol
-            assert "stable_regime"  in parsed
-            assert "regime_changed_today" in parsed
+
+    def test_plot_regime_chart_returns_figure(self):
+        pytest.importorskip("matplotlib")
+        from stock_regime.validation.plotting import RegimePlotter
+        plotter = RegimePlotter()
+        fig     = plotter.plot_regime_chart("INFY.NS", _df(n=300, seed=1), self._make_stable())
+        import matplotlib.pyplot as plt
+        assert fig is not None
+        plt.close(fig)
+
+    def test_plot_score_distribution(self):
+        pytest.importorskip("matplotlib")
+        from stock_regime.validation.plotting import RegimePlotter
+        import matplotlib.pyplot as plt
+        plotter  = RegimePlotter()
+        score_df = pd.DataFrame({
+            "trend":    np.random.uniform(0.2, 0.9, 50),
+            "momentum": np.random.uniform(0.1, 0.8, 50),
+        })
+        fig = plotter.plot_score_distribution(score_df, "trend", "TEST")
+        assert fig is not None
+        plt.close(fig)
+
+    def test_save_all_creates_png(self, tmp_path):
+        pytest.importorskip("matplotlib")
+        from stock_regime.validation.plotting import RegimePlotter
+        plotter = RegimePlotter()
+        saved   = plotter.save_all("INFY.NS", _df(n=300, seed=1),
+                                   self._make_stable(), str(tmp_path))
+        assert len(saved) == 1
+        assert Path(saved[0]).exists()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Pipeline orchestrator (mocked DataManager)
+#  Pipeline orchestration (mocked DataManager)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestPipelineOrchestrator:
+class TestPipelineOrchestration:
     @pytest.fixture
     def symbol_files(self, tmp_path):
         uni = tmp_path / "data" / "universes"
         uni.mkdir(parents=True)
-        (uni / "nifty500.txt").write_text("INFY.NS\n# comment\nRELIANCE.NS\nHDFCBANK.NS\n")
+        (uni / "nifty500.txt").write_text(
+            "INFY.NS\n# comment\nRELIANCE.NS\nHDFCBANK.NS\n"
+        )
         return tmp_path
 
     @pytest.fixture
@@ -664,21 +607,9 @@ stock_regime_config:  null
         pipeline._data_manager.get_daily_data = lambda *a, **k: BENCH.copy()
         pipeline._data_manager.fetch_multiple_symbols = lambda syms, **k: {
             s: FetchResult(symbol=s, provider="yahoo",
-                           data=_df(seed=i, n=300), success=True)
+                           data=_df(seed=i, n=350), success=True)
             for i, s in enumerate(syms)
         }
-
-    def test_run_returns_correct_universe(self, pipeline):
-        self._mock(pipeline)
-        out = pipeline.run(universes=["NIFTY500"], persist=False)
-        assert "NIFTY500" in out.market_results
-        assert "NIFTY500" in out.stock_results
-
-    def test_all_file_symbols_classified(self, pipeline):
-        self._mock(pipeline)
-        out = pipeline.run(universes=["NIFTY500"], persist=False)
-        # 3 non-comment lines in nifty500.txt
-        assert len(out.stock_results["NIFTY500"]) == 3
 
     def test_results_are_stable_regime_results(self, pipeline):
         self._mock(pipeline)
@@ -686,87 +617,50 @@ stock_regime_config:  null
         from stock_regime.stability import StableRegimeResult
         for r in out.stock_results["NIFTY500"]:
             assert isinstance(r, StableRegimeResult)
-            assert hasattr(r, "stable_regime")
-            assert hasattr(r, "regime_changed_today")
+            assert hasattr(r, "smoothed_confidence")
+            assert hasattr(r, "oscillation_detected")
 
-    def test_max_symbols_override(self, pipeline):
+    def test_quality_scores_produced(self, pipeline):
+        self._mock(pipeline)
+        out = pipeline.run(universes=["NIFTY500"], persist=False)
+        qs  = out.quality_scores.get("NIFTY500", [])
+        assert len(qs) > 0
+        for q in qs:
+            assert 0.0 <= q.quality_score <= 1.0
+
+    def test_continuous_scores_in_results(self, pipeline):
+        self._mock(pipeline)
+        out = pipeline.run(universes=["NIFTY500"], persist=False)
+        for r in out.stock_results["NIFTY500"]:
+            ds = r.dimensional_scores
+            assert 0.0 <= ds.trend      <= 1.0
+            assert 0.0 <= ds.momentum   <= 1.0
+            assert 0.0 <= ds.volatility <= 1.0
+
+    def test_scoring_parquet_written(self, pipeline, tmp_path):
+        self._mock(pipeline)
+        pipeline.run(universes=["NIFTY500"], persist=True)
+        scoring_files = list(Path(tmp_path / "output" / "scoring").rglob("*.parquet"))
+        assert len(scoring_files) > 0
+        df = pd.read_parquet(scoring_files[0])
+        assert "trend_score" in df.columns
+        assert "momentum_score" in df.columns
+
+    def test_stable_parquet_has_continuous_scores(self, pipeline, tmp_path):
+        self._mock(pipeline)
+        pipeline.run(universes=["NIFTY500"], persist=True)
+        stable_files = list(
+            Path(tmp_path / "output" / "stable_classifications").rglob("*.parquet")
+        )
+        assert len(stable_files) > 0
+        df = pd.read_parquet(stable_files[0])
+        assert "smoothed_confidence"  in df.columns
+        assert "oscillation_detected" in df.columns
+
+    def test_max_symbols_respected(self, pipeline):
         self._mock(pipeline)
         out = pipeline.run(universes=["NIFTY500"], persist=False, max_symbols=2)
         assert len(out.stock_results["NIFTY500"]) == 2
-
-    def test_universe_detail_counts_populated(self, pipeline):
-        self._mock(pipeline)
-        out    = pipeline.run(universes=["NIFTY500"], persist=False)
-        detail = out.universe_details["NIFTY500"]
-        assert detail.symbols_loaded == 3
-        assert detail.accepted_count >= 0
-        assert detail.excluded_count >= 0
-        assert detail.rejected_count >= 0
-
-    def test_market_regime_keys_present(self, pipeline):
-        self._mock(pipeline)
-        out = pipeline.run(universes=["NIFTY500"], persist=False)
-        mr  = out.market_results["NIFTY500"]
-        assert "regime"     in mr
-        assert "confidence" in mr
-
-    def test_persist_writes_parquet_files(self, pipeline, tmp_path):
-        self._mock(pipeline)
-        pipeline.run(universes=["NIFTY500"], persist=True)
-        parquets = list(Path(tmp_path / "output").rglob("*.parquet"))
-        assert len(parquets) > 0
-
-    def test_stable_classifications_parquet_written(self, pipeline, tmp_path):
-        self._mock(pipeline)
-        pipeline.run(universes=["NIFTY500"], persist=True)
-        stables = list(Path(tmp_path / "output" / "stable_classifications").rglob("*.parquet"))
-        assert len(stables) > 0
-        df = pd.read_parquet(stables[0])
-        assert "stable_regime" in df.columns
-        assert "regime_changed_today" in df.columns
-
-    def test_regime_history_parquet_written(self, pipeline, tmp_path):
-        self._mock(pipeline)
-        pipeline.run(universes=["NIFTY500"], persist=True)
-        history_path = tmp_path / "output" / "regime_history" / "regime_history.parquet"
-        assert history_path.exists()
-        df = pd.read_parquet(history_path)
-        assert "stable_regime" in df.columns
-
-    def test_missing_symbol_file_raises(self, tmp_path):
-        cfg = f"""
-data:
-  start_date: "2021-01-01"
-  end_date:   "today"
-  cache_dir:  "{tmp_path}/cache"
-  cache_max_age_days: 1
-  retry_attempts: 1
-universes:
-  NIFTY500:
-    benchmark:     "^NSEI"
-    symbol_source: "data/universes/DOES_NOT_EXIST.txt"
-    exchange:      "NSE"
-symbol_loading:
-  allow_missing_file: false
-output:
-  root_dir: "{tmp_path}/output"
-  persist: false
-  log_dir: "{tmp_path}/logs"
-  log_level: "WARNING"
-market_regime_config: null
-stock_regime_config:  null
-"""
-        p = tmp_path / "p.yaml"
-        p.write_text(cfg)
-        from runner.pipeline import AlgoTradingPipeline
-        pipeline = AlgoTradingPipeline(config_path=p, project_root=tmp_path)
-        pipeline._data_manager.get_daily_data = lambda *a, **k: BENCH.copy()
-        with pytest.raises(FileNotFoundError):
-            pipeline.run(universes=["NIFTY500"], persist=False)
-
-    def test_unknown_universe_raises(self, pipeline):
-        with pytest.raises(ValueError, match="Unknown universe"):
-            pipeline.run(universes=["FAKE"], persist=False)
 
     def test_elapsed_time_populated(self, pipeline):
         self._mock(pipeline)

@@ -5,48 +5,61 @@
 
 indicators:
   ema_periods:
-    fast: 20          # EMA-20 (short-term momentum)
-    mid:  50          # EMA-50 (medium-term trend)
-    slow: 200         # EMA-200 (macro trend anchor)
+    fast: 20
+    mid:  50
+    slow: 200
 
-  adx_period: 14
-  atr_period: 14
+  adx_period:       14
+  atr_period:       14
   volume_ma_period: 20
+  rs_period:        63       # legacy single-period RS
+  high_period:      252      # rolling high window
 
-  rs_period: 63       # Relative strength lookback (≈ 3 months / 1 quarter)
-  high_period: 252    # Rolling window for 52-week high proxy
+  # NEW: multi-period RS
+  rs_periods:
+    short:  21
+    medium: 63
+    long:   126
+  rs_trend_window: 10        # bars for RS slope calculation
 
 thresholds:
-  # ── ADX ──────────────────────────────────────────────────────
-  adx_strong_trend: 25.0    # ADX ≥ this → trend is strong
-  adx_weak_trend:   18.0    # ADX < this → market is directionless
+  # ADX
+  adx_strong_trend: 25.0
+  adx_weak_trend:   18.0
 
-  # ── ATR ratio (ATR / ATR_MA) ─────────────────────────────────
+  # ATR ratio
   atr_ma_period:        20
-  atr_volatile_ratio:   1.30  # > this → VOLATILE signal
-  atr_quiet_ratio:      0.70  # < this → QUIET signal
-  atr_compressed_ratio: 0.75  # < this → compressed / BREAKOUT_SETUP setup
-  atr_expanding_ratio:  1.00  # > this → ATR above its own average (expanding)
+  atr_volatile_ratio:   1.30
+  atr_quiet_ratio:      0.70
+  atr_compressed_ratio: 0.75
+  atr_expanding_ratio:  1.00
 
-  # ── EMA slope ────────────────────────────────────────────────
+  # EMA slope
   ema_slope_window:   5
-  ema_flat_threshold: 0.001   # |slope| < this → EMA is flat
+  ema_flat_threshold: 0.001
 
-  # ── Volume ───────────────────────────────────────────────────
-  volume_surge_ratio: 1.50    # volume / vol_MA ≥ this → volume confirms move
+  # Volume
+  volume_surge_ratio: 1.50
 
-  # ── Relative Strength ────────────────────────────────────────
-  rs_positive_threshold: 1.02  # RS ≥ this → stock is outperforming benchmark
-  rs_negative_threshold: 0.98  # RS ≤ this → stock is underperforming benchmark
-  rs_strong_threshold:   1.05  # RS ≥ this → strong outperformance (momentum)
+  # Relative Strength
+  rs_positive_threshold: 1.02
+  rs_negative_threshold: 0.98
+  rs_strong_threshold:   1.05
+  rs_trend_positive_threshold: 0.0005  # NEW: slope threshold for rs_improving
 
-  # ── Breakout Setup ───────────────────────────────────────────
-  near_high_pct: 0.03          # close within 3 % of rolling high → near high
+  # Breakout
+  near_high_pct: 0.03
+
+  # NEW: Momentum / ROC signals
+  acceleration_threshold: 0.5    # roc_10 - roc_21 > this → accelerating
+  roc_positive_min: 0.0          # roc_10 > 0 → price rising
+
+  # NEW: Trend quality
+  higher_highs_window:    20     # look-back bars for higher-highs count
+  higher_highs_min_count: 5      # count >= this → higher_highs signal True
+  ema_extended_pct:       0.10   # (close-ema200)/ema200 > 10% → extended
 
 scoring:
-  # Weights must sum to 1.0 per regime group.
-  # Signal names must match fields in StockSignals.
-
   trend_up:
     price_above_ema200: 0.25
     ema20_above_ema50:  0.25
@@ -86,36 +99,26 @@ scoring:
     atr_low:  0.65
     adx_weak: 0.35
 
-  # Regime is UNCERTAIN when no candidate clears this threshold
   min_confidence: 0.50
 
-# ── Dimensional scores (for ranking, not classification) ──────────
-# These are separate weighted sums that describe trend strength,
-# momentum, and volatility on a [0, 1] scale.
+# ── Dimensional scoring weights (continuous — NEW) ───────────────
 dimensional_scores:
   trend:
-    price_above_ema200: 0.30
-    ema20_above_ema50:  0.30
-    adx_strong:         0.25
-    rs_positive:        0.15
+    price_above_ema200: 0.40   # mapped to ema_alignment_score
+    ema20_above_ema50:  0.20   # partial weight within ema_alignment
+    adx_strong:         0.25   # mapped to adx_score
+    rs_positive:        0.15   # mapped to rs_score
 
   momentum:
-    rs_strong:        0.40
-    volume_confirmed: 0.30
-    adx_strong:       0.20
-    atr_expanding:    0.10
+    rs_strong:        0.35   # mapped to roc_score (price velocity)
+    volume_confirmed: 0.25   # mapped to volume_score
+    adx_strong:       0.25   # mapped to rs_trend_score (RS direction)
+    atr_expanding:    0.15   # mapped to atr_expansion_score
 
-  # Volatility score = min(atr / atr_ma, 2.0) / 2.0
-  # Computed directly from the indicator ratio — not signal-weighted.
-
-# ── Market context alignment ──────────────────────────────────────
-# Post-classification confidence adjustment.
-# When a stock's regime aligns with the market regime, multiply
-# confidence by alignment_boost; when it contradicts, by penalty.
+# ── Market context alignment ─────────────────────────────────────
 market_context:
-  alignment_boost:      1.10   # 10 % boost for tailwind
-  misalignment_penalty: 0.90   # 10 % haircut for headwind
-  # Market regime → stock regimes that are considered "aligned"
+  alignment_boost:      1.10
+  misalignment_penalty: 0.90
   aligned_regimes:
     BULLISH_TREND:  ["TREND_UP", "MOMENTUM", "BREAKOUT_SETUP"]
     BEARISH_TREND:  ["TREND_DOWN", "VOLATILE"]
@@ -124,14 +127,24 @@ market_context:
     QUIET:          ["QUIET", "RANGE"]
     UNCERTAIN:      []
 
-# ── Ranking ───────────────────────────────────────────────────────
+# ── Ranking ──────────────────────────────────────────────────────
 ranking:
-  top_n: 50   # Max stocks per ranked list
+  top_n: 50
+  opportunity_scoring:
+    trend_weight:      0.30
+    momentum_weight:   0.25
+    stability_weight:  0.25
+    low_vol_weight:    0.20
+    min_regime_age_for_full_score: 5
+    regime_penalties:
+      UNCERTAIN: 0.0
+      VOLATILE:  0.5
+      QUIET:     0.6
 
-# ── Universe Filters (Phase 1) ────────────────────────────────
+# ── Universe Filters ─────────────────────────────────────────────
 filters:
   history:
-    min_bars:             220
+    min_bars:             300      # raised from 220 — enforces strict history
     max_gap_days:         5
     max_stale_days:       3
     gap_lookback_days:    90
@@ -169,13 +182,35 @@ filters:
 
   high_rejection_warning_pct: 30.0
 
-# ── Data Quality (Phase 2) ────────────────────────────────────
+# ── Data Quality ─────────────────────────────────────────────────
 quality:
   fatal_spike_pct:    0.60
   warn_spike_pct:     0.20
   zero_volume_fill:   true
 
-# ── Regime Stability (Phase 3) ────────────────────────────────
+# ── Regime Stability ─────────────────────────────────────────────
 stability:
   confirmation_bars:      3
   uncertain_propagates:   false
+
+  # NEW: confidence smoothing and hysteresis
+  smoothing_enabled:      true
+  smoothing_alpha:        0.30    # EWM alpha: lower = smoother
+  hysteresis_threshold:   0.05    # new regime needs score > current + this
+  persistence_window:     5       # bars to check for oscillation detection
+  regime_switch_threshold: 0.55   # min smoothed confidence to switch regime
+
+# ── Opportunity Quality Engine (NEW) ─────────────────────────────
+quality_engine:
+  weights:
+    liquidity:   0.25
+    trend_clean: 0.25
+    vol_health:  0.20
+    stability:   0.20
+    tradability: 0.10
+  min_quality_score: 0.50
+
+# ── Score Distribution Logging ────────────────────────────────────
+score_diagnostics:
+  persist_distributions: true
+  log_top_percentile: 90   # log stocks above this percentile in each score

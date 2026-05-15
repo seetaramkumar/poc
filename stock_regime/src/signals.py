@@ -1,51 +1,34 @@
 """
 stock_regime/src/signals.py
 ============================
-Converts a StockIndicatorSnapshot into named boolean StockSignals.
+Converts StockIndicatorSnapshot → boolean StockSignals.
 
-All threshold comparisons live exclusively in this module — not in the
-scorer, not in the classifier.  Keeping this layer thin and pure means
-the scoring and classification layers remain testable in isolation.
-
-Design note
------------
-Each boolean extraction is guarded against None.  When an indicator has
-not yet been computed (insufficient history), the corresponding signal
-defaults to False.  The downstream scorer handles this gracefully because
-False contributes 0.0 to the weighted sum.
+Changes from previous version
+------------------------------
+- Added roc_positive, roc_accelerating (momentum separation)
+- Added rs_improving, rs_weakening (improved RS logic)
+- Added higher_highs, ema_extended (trend quality)
+- rs_positive/rs_negative/rs_strong now derive from rs_3m (not legacy rs)
+  while falling back to relative_strength if rs_3m unavailable
 """
 
 from __future__ import annotations
 
+import logging
+
 from .config_loader import StockEngineConfig
 from .models import StockIndicatorSnapshot, StockSignals
 
+logger = logging.getLogger(__name__)
+
 
 class StockSignalExtractor:
-    """
-    Derives boolean signals from a StockIndicatorSnapshot.
-
-    Parameters
-    ----------
-    config : StockEngineConfig
-        Provides all numeric thresholds.
-    """
+    """Derives boolean signals from a StockIndicatorSnapshot."""
 
     def __init__(self, config: StockEngineConfig) -> None:
         self.thr = config.thresholds
 
     def extract(self, snap: StockIndicatorSnapshot) -> StockSignals:
-        """
-        Convert numeric indicator values into boolean StockSignals.
-
-        Parameters
-        ----------
-        snap : StockIndicatorSnapshot
-
-        Returns
-        -------
-        StockSignals
-        """
         sig = StockSignals()
         thr = self.thr
 
@@ -74,7 +57,6 @@ class StockSignalExtractor:
         # ── ATR regime ───────────────────────────────────────────────
         if snap.atr is not None and snap.atr_ma is not None and snap.atr_ma > 0:
             ratio = snap.atr / snap.atr_ma
-
             sig.atr_high       = bool(ratio >= thr.atr_volatile_ratio)
             sig.atr_low        = bool(ratio <= thr.atr_quiet_ratio)
             sig.atr_compressed = bool(ratio <= thr.atr_compressed_ratio)
@@ -86,16 +68,41 @@ class StockSignalExtractor:
                 snap.volume >= snap.volume_ma * thr.volume_surge_ratio
             )
 
-        # ── Relative Strength ────────────────────────────────────────
-        if snap.relative_strength is not None:
-            rs = snap.relative_strength
-            sig.rs_positive = bool(rs >= thr.rs_positive_threshold)
-            sig.rs_negative = bool(rs <= thr.rs_negative_threshold)
-            sig.rs_strong   = bool(rs >= thr.rs_strong_threshold)
+        # ── Relative Strength (use rs_3m preferentially) ─────────────
+        # rs_3m is the improved multi-period RS; fall back to legacy rs
+        rs_val = snap.rs_3m if snap.rs_3m is not None else snap.relative_strength
+        if rs_val is not None:
+            sig.rs_positive = bool(rs_val >= thr.rs_positive_threshold)
+            sig.rs_negative = bool(rs_val <= thr.rs_negative_threshold)
+            sig.rs_strong   = bool(rs_val >= thr.rs_strong_threshold)
+
+        # ── NEW: RS trend (improving vs weakening) ────────────────────
+        if snap.rs_trend is not None:
+            rs_trend_thr = float(getattr(thr, "rs_trend_positive_threshold", 0.0005))
+            sig.rs_improving = bool(snap.rs_trend >  rs_trend_thr)
+            sig.rs_weakening = bool(snap.rs_trend < -rs_trend_thr)
 
         # ── Near 52-week high ────────────────────────────────────────
         if snap.close is not None and snap.high_52w is not None and snap.high_52w > 0:
             pct_from_high = (snap.high_52w - snap.close) / snap.high_52w
             sig.price_near_52w_high = bool(pct_from_high <= thr.near_high_pct)
+
+        # ── NEW: Rate of change (momentum) ────────────────────────────
+        if snap.roc_10 is not None:
+            sig.roc_positive = bool(snap.roc_10 > 0)
+
+        if snap.acceleration is not None:
+            accel_thr = float(getattr(thr, "acceleration_threshold", 0.5))
+            sig.roc_accelerating = bool(snap.acceleration > accel_thr)
+
+        # ── NEW: Trend quality — higher highs ────────────────────────
+        if snap.higher_highs_count is not None:
+            hh_thr = int(getattr(thr, "higher_highs_min_count", 5))
+            sig.higher_highs = bool(snap.higher_highs_count >= hh_thr)
+
+        # ── NEW: EMA extended (price far above trend) ─────────────────
+        if snap.ema_distance_pct is not None:
+            ext_thr = float(getattr(thr, "ema_extended_pct", 0.10))
+            sig.ema_extended = bool(snap.ema_distance_pct > ext_thr)
 
         return sig

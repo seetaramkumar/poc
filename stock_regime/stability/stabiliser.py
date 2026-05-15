@@ -1,33 +1,16 @@
 """
 stock_regime/stability/stabiliser.py
 ======================================
-Prevents single-bar regime flips by requiring a regime to persist for
-``confirmation_bars`` consecutive bars before it is declared stable.
+Regime confirmation window + confidence smoothing + hysteresis.
 
-How it works
-------------
-Every run, the stabiliser receives:
-  1. Today's raw classifications (list[StockRegimeResult])
-  2. The regime history for each symbol (loaded from regime_history.parquet)
-
-It computes for each symbol:
-  - How many consecutive bars the raw regime has matched
-  - Whether that count meets the confirmation threshold
-  - What the current stable regime is (may lag the raw regime by N bars)
-
-Key invariants
---------------
-- UNCERTAIN never replaces a confirmed stable regime.
-  If today is UNCERTAIN but the last stable regime was TREND_UP, the
-  stable regime stays TREND_UP until a different non-UNCERTAIN regime
-  is confirmed.
-
-- regime_changed_today is True ONLY on the first bar where stable_regime
-  transitions.  It is False on all subsequent bars of the same stable regime.
-
-- regime_age_bars counts consecutive bars of the RAW regime, not stable.
-  This is intentional: it tells the consumer how long the underlying signal
-  has been present, not how long the confirmed label has been assigned.
+Changes from previous version
+------------------------------
+- Added EWM confidence smoothing (smoothing_alpha from config)
+- Added hysteresis: new regime needs smoothed confidence >
+  current regime confidence + hysteresis_threshold to switch
+- Added oscillation detection via persistence_window
+- Added regime_switch_threshold: min smoothed confidence to accept
+- StableRegimeResult gains: smoothed_confidence, oscillation_detected
 """
 
 from __future__ import annotations
@@ -44,36 +27,31 @@ from ..src.models import StockRegime, StockRegimeResult
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Extended result model
-# ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class StableRegimeResult:
-    """
-    StockRegimeResult extended with stability metadata.
-
-    All fields from StockRegimeResult are preserved.  The stability
-    fields are added on top.
-    """
-    # ── Original StockRegimeResult fields ────────────────────────────────────
+    """StockRegimeResult extended with stability metadata."""
+    # Original fields
     symbol:             str
     market:             str
-    stock_regime:       StockRegime      # raw (unconfirmed) regime from the engine
+    stock_regime:       StockRegime
     confidence:         float
-    dimensional_scores: object           # DimensionalScores
+    dimensional_scores: object
     regime_scores:      dict
-    signals:            object           # StockSignals
-    indicators:         object           # StockIndicatorSnapshot
-    error:              Optional[str]    = None
+    signals:            object
+    indicators:         object
+    error:              Optional[str] = None
 
-    # ── Stability fields ─────────────────────────────────────────────────────
-    stable_regime:        StockRegime    = StockRegime.UNCERTAIN
-    prior_stable_regime:  StockRegime    = StockRegime.UNCERTAIN
-    regime_age_bars:      int            = 0   # consecutive bars of current RAW regime
-    stable_regime_age:    int            = 0   # consecutive bars of STABLE regime
-    regime_changed_today: bool           = False
+    # Stability fields
+    stable_regime:        StockRegime = StockRegime.UNCERTAIN
+    prior_stable_regime:  StockRegime = StockRegime.UNCERTAIN
+    regime_age_bars:      int         = 0
+    stable_regime_age:    int         = 0
+    regime_changed_today: bool        = False
     run_date:             Optional[date] = None
+
+    # NEW: smoothing / hysteresis fields
+    smoothed_confidence:  float = 0.0
+    oscillation_detected: bool  = False
 
     @classmethod
     def from_result(
@@ -85,39 +63,44 @@ class StableRegimeResult:
         stable_regime_age:    int,
         regime_changed_today: bool,
         run_date:             Optional[date] = None,
+        smoothed_confidence:  float = 0.0,
+        oscillation_detected: bool  = False,
     ) -> "StableRegimeResult":
         return cls(
-            symbol             = result.symbol,
-            market             = result.market,
-            stock_regime       = result.stock_regime,
-            confidence         = result.confidence,
-            dimensional_scores = result.dimensional_scores,
-            regime_scores      = result.regime_scores,
-            signals            = result.signals,
-            indicators         = result.indicators,
-            error              = result.error,
-            stable_regime      = stable_regime,
-            prior_stable_regime= prior_stable_regime,
-            regime_age_bars    = regime_age_bars,
-            stable_regime_age  = stable_regime_age,
+            symbol               = result.symbol,
+            market               = result.market,
+            stock_regime         = result.stock_regime,
+            confidence           = result.confidence,
+            dimensional_scores   = result.dimensional_scores,
+            regime_scores        = result.regime_scores,
+            signals              = result.signals,
+            indicators           = result.indicators,
+            error                = result.error,
+            stable_regime        = stable_regime,
+            prior_stable_regime  = prior_stable_regime,
+            regime_age_bars      = regime_age_bars,
+            stable_regime_age    = stable_regime_age,
             regime_changed_today = regime_changed_today,
-            run_date           = run_date,
+            run_date             = run_date,
+            smoothed_confidence  = smoothed_confidence,
+            oscillation_detected = oscillation_detected,
         )
 
     def is_valid(self) -> bool:
         return self.error is None
 
     def to_dict(self) -> dict:
-        """Serialise to the public JSON contract (extends StockRegimeResult.to_dict)."""
         import math
         snap = self.indicators
         ds   = self.dimensional_scores
 
         def _clean(v):
-            if v is None: return None
+            if v is None:
+                return None
             try:
                 return None if math.isnan(v) or math.isinf(v) else round(v, 4)
-            except: return None
+            except Exception:
+                return None
 
         return {
             "symbol":               self.symbol,
@@ -126,9 +109,11 @@ class StableRegimeResult:
             "stable_regime":        self.stable_regime.value,
             "prior_stable_regime":  self.prior_stable_regime.value,
             "confidence":           round(self.confidence, 4),
+            "smoothed_confidence":  round(self.smoothed_confidence, 4),
             "regime_age_bars":      self.regime_age_bars,
             "stable_regime_age":    self.stable_regime_age,
             "regime_changed_today": self.regime_changed_today,
+            "oscillation_detected": self.oscillation_detected,
             "scores": {
                 "trend":      round(ds.trend, 4),
                 "momentum":   round(ds.momentum, 4),
@@ -143,56 +128,68 @@ class StableRegimeResult:
                 "adx":               _clean(snap.adx),
                 "atr":               _clean(snap.atr),
                 "relative_strength": _clean(snap.relative_strength),
+                "roc_10":            _clean(snap.roc_10),
+                "roc_21":            _clean(snap.roc_21),
+                "rs_3m":             _clean(snap.rs_3m),
+                "rs_trend":          _clean(snap.rs_trend),
             },
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Per-symbol history record (in-memory representation)
-# ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class SymbolHistory:
-    """
-    Lightweight in-memory record of a symbol's recent regime history.
-    Loaded from regime_history.parquet and updated after each run.
-    """
-    symbol:        str
-    raw_regimes:   list[str]   = field(default_factory=list)  # last N raw regime values
-    stable_regime: str         = StockRegime.UNCERTAIN.value
-    stable_age:    int         = 0
+    """In-memory record of a symbol's recent regime history."""
+    symbol:              str
+    raw_regimes:         list[str]   = field(default_factory=list)
+    raw_confidences:     list[float] = field(default_factory=list)
+    stable_regime:       str         = StockRegime.UNCERTAIN.value
+    stable_age:          int         = 0
+    smoothed_confidence: float       = 0.0
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Stabiliser
-# ─────────────────────────────────────────────────────────────────────────────
 
 class RegimeStabiliser:
     """
-    Applies a confirmation window to raw regime classifications.
+    Applies confirmation window, EWM confidence smoothing, and hysteresis.
 
     Parameters
     ----------
-    confirmation_bars :
-        Number of consecutive bars a raw regime must hold before it is
-        declared stable.  Default 3.
-    uncertain_propagates :
-        When True, UNCERTAIN overwrites any stable regime immediately
-        (no confirmation required).  When False (default), UNCERTAIN is
-        treated as a non-event and the last stable regime is preserved.
+    confirmation_bars : int
+        Bars a raw regime must persist before becoming stable.
+    uncertain_propagates : bool
+        When False (default), UNCERTAIN never overwrites a stable regime.
+    smoothing_enabled : bool
+        Apply EWM smoothing to confidence before switching decisions.
+    smoothing_alpha : float
+        EWM decay factor (0 < alpha < 1). Lower = smoother.
+    hysteresis_threshold : float
+        New regime needs smoothed confidence > current + this to switch.
+    persistence_window : int
+        Look-back bars for oscillation detection.
+    regime_switch_threshold : float
+        Minimum smoothed confidence to accept a regime switch.
     """
 
     def __init__(
         self,
-        confirmation_bars:    int  = 3,
-        uncertain_propagates: bool = False,
+        confirmation_bars:      int   = 3,
+        uncertain_propagates:   bool  = False,
+        smoothing_enabled:      bool  = True,
+        smoothing_alpha:        float = 0.30,
+        hysteresis_threshold:   float = 0.05,
+        persistence_window:     int   = 5,
+        regime_switch_threshold: float = 0.55,
     ) -> None:
-        self.confirmation_bars    = confirmation_bars
-        self.uncertain_propagates = uncertain_propagates
+        self.confirmation_bars       = confirmation_bars
+        self.uncertain_propagates    = uncertain_propagates
+        self.smoothing_enabled       = smoothing_enabled
+        self.smoothing_alpha         = smoothing_alpha
+        self.hysteresis_threshold    = hysteresis_threshold
+        self.persistence_window      = persistence_window
+        self.regime_switch_threshold = regime_switch_threshold
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  Primary API
-    # ──────────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
+    #  Public API
+    # ──────────────────────────────────────────────────────────────
 
     def apply(
         self,
@@ -200,54 +197,41 @@ class RegimeStabiliser:
         history:       dict[str, SymbolHistory],
         run_date:      Optional[date] = None,
     ) -> list[StableRegimeResult]:
-        """
-        Apply the confirmation window to today's raw classifications.
-
-        Parameters
-        ----------
-        today_results :
-            Raw StockRegimeResult objects from StockRegimeEngine.
-        history :
-            Per-symbol history, keyed by symbol.  Load from
-            regime_history.parquet before calling.  Will be mutated
-            in-place to reflect today's run (so the caller can persist it).
-        run_date :
-            Date of this run.  Defaults to today.
-
-        Returns
-        -------
-        list[StableRegimeResult]
-            One per input symbol, in the same order.
-        """
         run_date = run_date or date.today()
         stable_results: list[StableRegimeResult] = []
 
         for result in today_results:
-            sym     = result.symbol
-            hist    = history.get(sym, SymbolHistory(symbol=sym))
-            history[sym] = hist   # ensure it's in the dict for next time
+            sym  = result.symbol
+            hist = history.get(sym, SymbolHistory(symbol=sym))
+            history[sym] = hist
 
             stable = self._stabilise(result, hist, run_date)
             stable_results.append(stable)
 
             # Update history in-place
             hist.raw_regimes.append(result.stock_regime.value)
-            # Keep only the last confirmation_bars + 1 entries
-            hist.raw_regimes = hist.raw_regimes[-(self.confirmation_bars + 1):]
-            hist.stable_regime = stable.stable_regime.value
-            hist.stable_age    = stable.stable_regime_age
+            hist.raw_confidences.append(result.confidence)
+            keep = self.confirmation_bars + self.persistence_window + 1
+            hist.raw_regimes     = hist.raw_regimes[-keep:]
+            hist.raw_confidences = hist.raw_confidences[-keep:]
+            hist.stable_regime       = stable.stable_regime.value
+            hist.stable_age          = stable.stable_regime_age
+            hist.smoothed_confidence = stable.smoothed_confidence
 
         changed = sum(1 for r in stable_results if r.regime_changed_today)
+        oscillating = sum(1 for r in stable_results if r.oscillation_detected)
         logger.info(
-            "RegimeStabiliser: %d symbols | %d regime changes today "
-            "(confirmation=%d bars)",
-            len(stable_results), changed, self.confirmation_bars,
+            "RegimeStabiliser: %d symbols | %d changes | %d oscillating "
+            "(confirmation=%d bars  smoothing=%s)",
+            len(stable_results), changed, oscillating,
+            self.confirmation_bars,
+            "on" if self.smoothing_enabled else "off",
         )
         return stable_results
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
     #  Per-symbol logic
-    # ──────────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
 
     def _stabilise(
         self,
@@ -255,9 +239,18 @@ class RegimeStabiliser:
         hist:     SymbolHistory,
         run_date: date,
     ) -> StableRegimeResult:
-        raw_today = result.stock_regime
+        raw_today   = result.stock_regime
+        raw_conf    = result.confidence
+        prior_stable = StockRegime(hist.stable_regime) if hist.stable_regime else StockRegime.UNCERTAIN
 
-        # Count consecutive bars of the current raw regime (including today)
+        # ── 1. EWM confidence smoothing ──────────────────────────────
+        if self.smoothing_enabled and hist.smoothed_confidence > 0:
+            alpha = self.smoothing_alpha
+            smoothed_conf = alpha * raw_conf + (1 - alpha) * hist.smoothed_confidence
+        else:
+            smoothed_conf = raw_conf
+
+        # ── 2. Consecutive-bar count for raw regime ──────────────────
         age = 1
         for prior_raw in reversed(hist.raw_regimes):
             if prior_raw == raw_today.value:
@@ -265,17 +258,33 @@ class RegimeStabiliser:
             else:
                 break
 
-        # Determine the new stable regime
-        prior_stable = StockRegime(hist.stable_regime) if hist.stable_regime else StockRegime.UNCERTAIN
+        # ── 3. Oscillation detection ─────────────────────────────────
+        recent_regimes = hist.raw_regimes[-(self.persistence_window):]
+        unique_recent  = len(set(recent_regimes))
+        oscillation    = (
+            len(recent_regimes) >= self.persistence_window and
+            unique_recent >= max(self.persistence_window // 2, 2)
+        )
 
+        # ── 4. Determine new stable regime ───────────────────────────
         if raw_today == StockRegime.UNCERTAIN and not self.uncertain_propagates:
-            # UNCERTAIN does not replace an established stable regime
             new_stable = prior_stable
+
         elif age >= self.confirmation_bars:
-            # Confirmation threshold met → accept the raw regime as stable
-            new_stable = raw_today
+            # Hysteresis: only switch if smoothed confidence is meaningfully
+            # higher than the current regime's smoothed confidence AND meets
+            # the minimum switch threshold
+            meets_threshold = smoothed_conf >= self.regime_switch_threshold
+            hysteresis_ok   = (
+                raw_today == prior_stable or
+                smoothed_conf >= hist.smoothed_confidence + self.hysteresis_threshold
+            )
+
+            if meets_threshold and hysteresis_ok and not oscillation:
+                new_stable = raw_today
+            else:
+                new_stable = prior_stable
         else:
-            # Not yet confirmed → hold the prior stable regime
             new_stable = prior_stable
 
         changed   = new_stable != prior_stable
@@ -283,12 +292,19 @@ class RegimeStabiliser:
 
         if changed:
             logger.info(
-                "%s regime_change: %s → %s (raw=%s confirmed after %d bars)",
+                "%s regime_change: %s → %s  (raw=%s  age=%d  conf=%.2f  smooth=%.2f)",
                 result.symbol,
                 prior_stable.value,
                 new_stable.value,
                 raw_today.value,
                 age,
+                raw_conf,
+                smoothed_conf,
+            )
+        elif oscillation:
+            logger.debug(
+                "%s oscillation_detected: %d unique regimes in last %d bars",
+                result.symbol, unique_recent, self.persistence_window,
             )
 
         return StableRegimeResult.from_result(
@@ -299,43 +315,37 @@ class RegimeStabiliser:
             stable_regime_age    = new_s_age,
             regime_changed_today = changed,
             run_date             = run_date,
+            smoothed_confidence  = round(smoothed_conf, 4),
+            oscillation_detected = oscillation,
         )
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  History persistence helpers
-    # ──────────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
+    #  History I/O
+    # ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def load_history(path: str | None) -> dict[str, SymbolHistory]:
-        """
-        Load per-symbol regime history from a parquet file.
-
-        Returns an empty dict if the path is None or the file does not exist.
-        """
         from pathlib import Path
         if path is None:
             return {}
         p = Path(path)
         if not p.exists():
-            logger.debug("No regime history file at '%s' — starting fresh.", p)
+            logger.debug("No regime history at '%s' — starting fresh.", p)
             return {}
 
         df = pd.read_parquet(p)
         history: dict[str, SymbolHistory] = {}
-
-        # We keep the last confirmation_bars rows per symbol
         for symbol, sym_df in df.groupby("symbol"):
             sym_df = sym_df.sort_values("run_date")
-            raw_regimes = sym_df["raw_regime"].tolist()
-            last_stable = sym_df["stable_regime"].iloc[-1]
-            stable_age  = int(sym_df["stable_regime_age"].iloc[-1])
             history[symbol] = SymbolHistory(
-                symbol        = symbol,
-                raw_regimes   = raw_regimes,
-                stable_regime = last_stable,
-                stable_age    = stable_age,
+                symbol               = symbol,
+                raw_regimes          = sym_df["raw_regime"].tolist(),
+                raw_confidences      = sym_df["confidence"].tolist(),
+                stable_regime        = sym_df["stable_regime"].iloc[-1],
+                stable_age           = int(sym_df["stable_regime_age"].iloc[-1]),
+                smoothed_confidence  = float(sym_df.get("smoothed_confidence", pd.Series([0.0])).iloc[-1]),
             )
-        logger.debug("Loaded history for %d symbols from '%s'.", len(history), p)
+        logger.debug("Loaded history for %d symbols.", len(history))
         return history
 
     @staticmethod
@@ -344,48 +354,32 @@ class RegimeStabiliser:
         path: str,
         append: bool = True,
     ) -> None:
-        """
-        Persist today's stable regime results to parquet (append mode).
-
-        Parameters
-        ----------
-        stable_results :
-            Output of RegimeStabiliser.apply().
-        path :
-            Destination parquet file path.
-        append :
-            When True (default), read existing file and append.
-            When False, overwrite.  Use False only for testing.
-        """
         from pathlib import Path
-
-        rows = []
-        for r in stable_results:
-            rows.append({
-                "symbol":               r.symbol,
-                "market":               r.market,
-                "run_date":             r.run_date,
-                "raw_regime":           r.stock_regime.value,
-                "stable_regime":        r.stable_regime.value,
-                "prior_stable_regime":  r.prior_stable_regime.value,
-                "confidence":           r.confidence,
-                "regime_age_bars":      r.regime_age_bars,
-                "stable_regime_age":    r.stable_regime_age,
-                "regime_changed_today": r.regime_changed_today,
-            })
+        rows = [{
+            "symbol":               r.symbol,
+            "market":               r.market,
+            "run_date":             r.run_date,
+            "raw_regime":           r.stock_regime.value,
+            "stable_regime":        r.stable_regime.value,
+            "prior_stable_regime":  r.prior_stable_regime.value,
+            "confidence":           r.confidence,
+            "smoothed_confidence":  r.smoothed_confidence,
+            "regime_age_bars":      r.regime_age_bars,
+            "stable_regime_age":    r.stable_regime_age,
+            "regime_changed_today": r.regime_changed_today,
+            "oscillation_detected": r.oscillation_detected,
+        } for r in stable_results]
 
         new_df = pd.DataFrame(rows)
-        p      = Path(path)
+        p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
 
         if append and p.exists():
             existing = pd.read_parquet(p)
             combined = pd.concat([existing, new_df], ignore_index=True)
-            combined.drop_duplicates(
-                subset=["symbol", "run_date"], keep="last", inplace=True
-            )
+            combined.drop_duplicates(subset=["symbol", "run_date"], keep="last", inplace=True)
             combined.to_parquet(p, engine="pyarrow", compression="snappy", index=False)
         else:
             new_df.to_parquet(p, engine="pyarrow", compression="snappy", index=False)
 
-        logger.info("RegimeStabiliser: saved history → '%s' (%d rows).", p, len(new_df))
+        logger.info("Saved regime history → '%s' (%d rows).", p, len(new_df))

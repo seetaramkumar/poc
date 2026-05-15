@@ -1,8 +1,7 @@
 """
 runner/pipeline.py
 ==================
-AlgoTradingPipeline — the single orchestrator wiring:
-  trading_data → market_regime → stock_regime (quality + filter + stability)
+AlgoTradingPipeline — the single orchestrator wiring all modules.
 
 Pipeline steps per universe
 ---------------------------
@@ -13,8 +12,10 @@ Pipeline steps per universe
 5.  Data quality validation      (Phase 2)
 6.  Universe filter               (Phase 1)
 7.  Stock regime classification
-8.  Regime stability              (Phase 3)
-9.  Persist all outputs
+8.  Regime stability              (Phase 3 — with smoothing + hysteresis)
+9.  Opportunity quality scoring   (Phase 7)
+10. Score diagnostics + persist   (Phase 10)
+11. Regime analytics              (Phase 8)
 """
 
 from __future__ import annotations
@@ -42,7 +43,8 @@ _DEFAULT_PIPELINE_CONFIG = Path(__file__).parent / "config" / "pipeline.yaml"
 class UniverseRunResult:
     universe:        str
     market_regime:   dict
-    stock_results:   list
+    stock_results:   list           # list[StableRegimeResult]
+    quality_scores:  list           # list[QualityScore]
     failed_symbols:  dict[str, str]
     symbols_loaded:  int    = 0
     accepted_count:  int    = 0
@@ -56,6 +58,7 @@ class UniverseRunResult:
 class PipelineRunOutput:
     market_results:   dict[str, dict]              = field(default_factory=dict)
     stock_results:    dict[str, list]              = field(default_factory=dict)
+    quality_scores:   dict[str, list]              = field(default_factory=dict)
     universe_details: dict[str, UniverseRunResult] = field(default_factory=dict)
     run_date:         date                         = field(default_factory=date.today)
     elapsed_seconds:  float                        = 0.0
@@ -120,14 +123,9 @@ class SymbolFileLoader:
 
 class AlgoTradingPipeline:
     """
-    Orchestrates the full data → market regime → stock regime pipeline.
-
-    Parameters
-    ----------
-    config_path :
-        Path to pipeline.yaml.  Defaults to runner/config/pipeline.yaml.
-    project_root :
-        Absolute project root for symbol file resolution.
+    Orchestrates the full pipeline:
+    data → market regime → quality → filter → classify → stabilise →
+    quality scores → score diagnostics → analytics
     """
 
     def __init__(
@@ -190,6 +188,7 @@ class AlgoTradingPipeline:
             )
             output.market_results[universe_name]   = result.market_regime
             output.stock_results[universe_name]    = result.stock_results
+            output.quality_scores[universe_name]   = result.quality_scores
             output.universe_details[universe_name] = result
 
         output.elapsed_seconds = round(time.time() - t0, 2)
@@ -206,7 +205,6 @@ class AlgoTradingPipeline:
         persist:       bool = True,
         max_symbols:   Optional[int] = None,
     ) -> UniverseRunResult:
-        """Convenience wrapper — run one universe."""
         output = self.run(
             universes=[universe_name], run_date=run_date,
             persist=persist, max_symbols=max_symbols,
@@ -214,7 +212,7 @@ class AlgoTradingPipeline:
         return output.universe_details[universe_name]
 
     # ──────────────────────────────────────────────────────────────────────────
-    #  Per-universe pipeline  (9 steps)
+    #  Per-universe pipeline (11 steps)
     # ──────────────────────────────────────────────────────────────────────────
 
     def _run_universe(
@@ -226,10 +224,12 @@ class AlgoTradingPipeline:
         sym_cfg:       dict,
     ) -> UniverseRunResult:
 
-        from stock_regime.filters.universe_filter   import UniverseFilter
-        from stock_regime.quality.validator   import DataQualityValidator
-        from stock_regime.stability.stabiliser import RegimeStabiliser
-        from stock_regime.src.models import MarketRegimeInput
+        from stock_regime.filters        import UniverseFilter
+        from stock_regime.quality        import DataQualityValidator
+        from stock_regime.stability      import RegimeStabiliser
+        from stock_regime.quality_engine import OpportunityQualityEngine
+        from stock_regime.analytics      import RegimeAnalytics
+        from stock_regime.src.models     import MarketRegimeInput
 
         benchmark_symbol = universe_cfg["benchmark"]
         symbol_source    = universe_cfg["symbol_source"]
@@ -267,15 +267,15 @@ class AlgoTradingPipeline:
             logger.warning("No symbols for '%s' — skipping.", universe_name)
             return UniverseRunResult(
                 universe=universe_name, market_regime=market_result,
-                stock_results=[], failed_symbols={}, symbols_loaded=0,
-                benchmark_df=benchmark_df, run_date=self._run_date,
+                stock_results=[], quality_scores=[], failed_symbols={},
+                symbols_loaded=0, benchmark_df=benchmark_df, run_date=self._run_date,
             )
 
         # ── 4. Fetch stocks ───────────────────────────────────────────────
         stock_data, fetch_errors = self._fetch_stocks(symbols, start, end)
         failed_symbols.update(fetch_errors)
 
-        # ── 5. Data quality ───────────────────────────────────────────────
+        # ── 5. Data quality validation ────────────────────────────────────
         q_cfg     = getattr(self._stock_engine.config, "quality", None)
         validator = DataQualityValidator(
             fatal_spike_pct  = float(getattr(q_cfg, "fatal_spike_pct",  0.60)),
@@ -291,7 +291,7 @@ class AlgoTradingPipeline:
         # ── 6. Universe filter ────────────────────────────────────────────
         f_cfg = getattr(self._stock_engine.config, "filters", None)
         if f_cfg is not None:
-            uni_filter    = UniverseFilter.from_config(
+            uni_filter = UniverseFilter.from_config(
                 self._stock_engine.config, universe=universe_name, exchange=exchange,
             )
             f_result      = uni_filter.apply(q_report.clean, self._run_date)
@@ -311,10 +311,10 @@ class AlgoTradingPipeline:
                     universe_name, excluded_count, rejected_count, accepted_count)
 
         if not clean_data:
-            logger.warning("No symbols remain after quality+filter for '%s'.", universe_name)
+            logger.warning("No symbols remain for '%s'.", universe_name)
             return UniverseRunResult(
                 universe=universe_name, market_regime=market_result,
-                stock_results=[], failed_symbols=failed_symbols,
+                stock_results=[], quality_scores=[], failed_symbols=failed_symbols,
                 symbols_loaded=len(symbols), accepted_count=0,
                 excluded_count=excluded_count, rejected_count=rejected_count,
                 benchmark_df=benchmark_df, run_date=self._run_date,
@@ -331,11 +331,16 @@ class AlgoTradingPipeline:
             persist        = persist,
         )
 
-        # ── 8. Regime stability ───────────────────────────────────────────
-        s_cfg      = getattr(self._stock_engine.config, "stability", None)
+        # ── 8. Regime stability (smoothing + hysteresis) ──────────────────
+        s_cfg = getattr(self._stock_engine.config, "stability", None)
         stabiliser = RegimeStabiliser(
-            confirmation_bars    = int( getattr(s_cfg, "confirmation_bars",    3)),
-            uncertain_propagates = bool(getattr(s_cfg, "uncertain_propagates", False)),
+            confirmation_bars       = int(  getattr(s_cfg, "confirmation_bars",       3)),
+            uncertain_propagates    = bool( getattr(s_cfg, "uncertain_propagates",    False)),
+            smoothing_enabled       = bool( getattr(s_cfg, "smoothing_enabled",       True)),
+            smoothing_alpha         = float(getattr(s_cfg, "smoothing_alpha",         0.30)),
+            hysteresis_threshold    = float(getattr(s_cfg, "hysteresis_threshold",    0.05)),
+            persistence_window      = int(  getattr(s_cfg, "persistence_window",      5)),
+            regime_switch_threshold = float(getattr(s_cfg, "regime_switch_threshold", 0.55)),
         )
         history_path = (
             Path(self._cfg["output"]["root_dir"]) /
@@ -352,19 +357,37 @@ class AlgoTradingPipeline:
             if not r.is_valid():
                 failed_symbols[r.symbol] = r.error or "unknown"
 
+        # ── 9. Opportunity quality scoring ────────────────────────────────
+        quality_engine = OpportunityQualityEngine.from_config(
+            self._stock_engine.config
+        )
+        quality_scores = quality_engine.evaluate_batch(
+            stable_results, clean_data, run_date=self._run_date
+        )
+        if persist:
+            quality_engine.persist(quality_scores,
+                                   self._cfg["output"]["root_dir"],
+                                   universe=universe_name)
+
+        # ── 10. Score diagnostics ─────────────────────────────────────────
+        if persist:
+            self._persist_score_diagnostics(stable_results, universe_name)
+
+        # ── 11. Persist stable classifications + regime analytics ──────────
+        if persist:
+            self._persist_stable(stable_results, universe_name)
+            self._run_analytics(universe_name)
+
         if failed_symbols:
             logger.warning("%d symbols failed in '%s': %s",
                            len(failed_symbols), universe_name,
                            list(failed_symbols.keys())[:10])
 
-        # ── 9. Persist stable classifications ─────────────────────────────
-        if persist:
-            self._persist_stable(stable_results, universe_name)
-
         return UniverseRunResult(
             universe       = universe_name,
             market_regime  = market_result,
             stock_results  = stable_results,
+            quality_scores = quality_scores,
             failed_symbols = failed_symbols,
             symbols_loaded = len(symbols),
             accepted_count = accepted_count,
@@ -432,7 +455,7 @@ class AlgoTradingPipeline:
         df["run_date"] = self._run_date
         df["universe"] = universe
         df.to_parquet(path, engine="pyarrow", compression="snappy", index=False)
-        logger.info("Quality: %d anomalies → '%s'.", len(records), path)
+        logger.info("Quality anomalies [%s]: %d → '%s'.", universe, len(records), path)
 
     def _persist_filter(self, result, universe: str) -> None:
         out = self._output_dir("filters")
@@ -461,7 +484,8 @@ class AlgoTradingPipeline:
         rows = []
         for r in stable_results:
             ds = r.dimensional_scores
-            rows.append({
+            cs = ds.continuous
+            row = {
                 "symbol":               r.symbol,
                 "market":               r.market,
                 "run_date":             r.run_date,
@@ -469,14 +493,30 @@ class AlgoTradingPipeline:
                 "stable_regime":        r.stable_regime.value,
                 "prior_stable_regime":  r.prior_stable_regime.value,
                 "confidence":           r.confidence,
+                "smoothed_confidence":  r.smoothed_confidence,
                 "regime_age_bars":      r.regime_age_bars,
                 "stable_regime_age":    r.stable_regime_age,
                 "regime_changed_today": r.regime_changed_today,
+                "oscillation_detected": r.oscillation_detected,
                 "trend_score":          ds.trend,
                 "momentum_score":       ds.momentum,
                 "volatility_score":     ds.volatility,
                 "is_valid":             r.is_valid(),
-            })
+            }
+            # Attach continuous component scores for diagnostics
+            if cs is not None:
+                row.update({
+                    "adx_score":           cs.adx_score,
+                    "ema_alignment_score": cs.ema_alignment_score,
+                    "ema_distance_score":  cs.ema_distance_score,
+                    "atr_expansion_score": cs.atr_expansion_score,
+                    "rs_score":            cs.rs_score,
+                    "rs_trend_score":      cs.rs_trend_score,
+                    "roc_score":           cs.roc_score,
+                    "volume_score":        cs.volume_score,
+                })
+            rows.append(row)
+
         out  = self._output_dir("stable_classifications")
         path = out / f"{universe.lower()}_stable.parquet"
         pd.DataFrame(rows).to_parquet(
@@ -485,13 +525,69 @@ class AlgoTradingPipeline:
         logger.info("Stable classifications [%s]: %d rows → '%s'.",
                     universe, len(rows), path)
 
+    def _persist_score_diagnostics(self, stable_results: list, universe: str) -> None:
+        """Persist score distributions and log top-percentile thresholds."""
+        if not stable_results:
+            return
+        rows = []
+        for r in stable_results:
+            ds = r.dimensional_scores
+            rows.append({
+                "symbol":         r.symbol,
+                "trend_score":    ds.trend,
+                "momentum_score": ds.momentum,
+                "volatility_score": ds.volatility,
+                "stable_regime":  r.stable_regime.value,
+                "confidence":     r.confidence,
+                "smoothed_conf":  r.smoothed_confidence,
+            })
+        df   = pd.DataFrame(rows)
+        out  = self._output_dir("scoring")
+        path = out / f"{universe.lower()}_score_dist.parquet"
+        df.to_parquet(path, engine="pyarrow", compression="snappy", index=False)
+
+        # Log top-percentile thresholds
+        pct_cfg = getattr(
+            getattr(self._stock_engine.config, "score_diagnostics", None),
+            "log_top_percentile", 90
+        )
+        for col in ["trend_score", "momentum_score"]:
+            if col in df.columns:
+                p_val = df[col].quantile(pct_cfg / 100.0)
+                p_mean = df[col].mean()
+                p_std  = df[col].std()
+                logger.info(
+                    "ScoreDiag [%s] %s: mean=%.3f  std=%.3f  P%d=%.3f",
+                    universe, col, p_mean, p_std, pct_cfg, p_val,
+                )
+
+        logger.info("Score distributions [%s] → '%s'.", universe, path)
+
+    def _run_analytics(self, universe: str) -> None:
+        """Run regime analytics on accumulated history."""
+        from stock_regime.analytics import RegimeAnalytics
+        history_path = (
+            Path(self._cfg["output"]["root_dir"]) /
+            "regime_history" / "regime_history.parquet"
+        )
+        if not history_path.exists():
+            return
+        try:
+            analytics = RegimeAnalytics(
+                history_path, min_episode_bars=2, recent_change_days=5
+            )
+            report = analytics.compute(universe, as_of_date=self._run_date)
+            analytics.persist(report, self._cfg["output"]["root_dir"])
+        except Exception as exc:
+            logger.warning("Analytics failed for '%s': %s", universe, exc)
+
     # ──────────────────────────────────────────────────────────────────────────
     #  Engine initialisation
     # ──────────────────────────────────────────────────────────────────────────
 
     def _build_engines(self) -> None:
         from trading_data import DataManager, DataManagerConfig
-        from market_regime.src.engine import MarketRegimeEngine
+        from market_regime.src import MarketRegimeEngine
         from stock_regime.src import StockRegimeEngine
 
         data_cfg   = self._cfg["data"]
@@ -547,14 +643,18 @@ class AlgoTradingPipeline:
         for universe, results in output.stock_results.items():
             mr     = output.market_results.get(universe, {})
             detail = output.universe_details.get(universe)
+            qs     = output.quality_scores.get(universe, [])
+            avg_q  = (sum(q.quality_score for q in qs) / len(qs)) if qs else 0.0
             logger.info(
-                "%-10s  market=%-14s (%.2f)  loaded=%s  accepted=%s  classified=%d  failed=%d",
+                "%-10s  market=%-14s (%.2f)  loaded=%s  accepted=%s  "
+                "classified=%d  failed=%d  avg_quality=%.2f",
                 universe,
                 mr.get("regime", "N/A"), mr.get("confidence", 0.0),
                 getattr(detail, "symbols_loaded", "?"),
                 getattr(detail, "accepted_count", "?"),
                 len(results),
                 len(getattr(detail, "failed_symbols", {})),
+                avg_q,
             )
             counts: dict[str, int] = {}
             for r in results:

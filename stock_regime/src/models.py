@@ -3,8 +3,14 @@ stock_regime/src/models.py
 ==========================
 Typed data contracts for every layer of the Stock Regime Engine pipeline.
 
-Nothing outside this file should define ad-hoc dicts for engine I/O.
-All structured data flowing through the pipeline uses these types.
+Changes from previous version
+------------------------------
+- StockIndicatorSnapshot: added roc_10, roc_21, acceleration, rs_1m/3m/6m,
+  rs_trend, higher_highs_count, ema_distance_pct
+- StockSignals: added roc_positive, roc_accelerating, rs_improving,
+  rs_weakening, higher_highs, ema_extended
+- ContinuousScores dataclass (NEW) — replaces binary dimensional scoring
+- DimensionalScores: now wraps ContinuousScores; backward-compatible
 """
 
 from __future__ import annotations
@@ -15,50 +21,24 @@ from enum import Enum
 from typing import Optional
 
 
-# ─────────────────────────────────────────────────────────────
-#  Stock Regime Enum
-# ─────────────────────────────────────────────────────────────
-
 class StockRegime(str, Enum):
-    """
-    Eight canonical stock-level market states.
+    TREND_UP       = "TREND_UP"
+    TREND_DOWN     = "TREND_DOWN"
+    RANGE          = "RANGE"
+    MOMENTUM       = "MOMENTUM"
+    BREAKOUT_SETUP = "BREAKOUT_SETUP"
+    VOLATILE       = "VOLATILE"
+    QUIET          = "QUIET"
+    UNCERTAIN      = "UNCERTAIN"
 
-    Inheriting from ``str`` makes JSON serialisation trivial and
-    allows direct string comparison without calling ``.value``.
-    """
-    TREND_UP       = "TREND_UP"        # confirmed uptrend with momentum
-    TREND_DOWN     = "TREND_DOWN"      # confirmed downtrend with momentum
-    RANGE          = "RANGE"           # sideways / consolidation
-    MOMENTUM       = "MOMENTUM"        # strong relative outperformance
-    BREAKOUT_SETUP = "BREAKOUT_SETUP"  # volatility compression near key level
-    VOLATILE       = "VOLATILE"        # elevated daily range vs history
-    QUIET          = "QUIET"           # compressed daily range vs history
-    UNCERTAIN      = "UNCERTAIN"       # no regime cleared min confidence
-
-
-# ─────────────────────────────────────────────────────────────
-#  Market Regime Input (consumed from Market Regime Engine)
-# ─────────────────────────────────────────────────────────────
 
 @dataclass
 class MarketRegimeInput:
-    """
-    Structured container for the Market Regime Engine output that is
-    consumed as context by the Stock Regime Engine.
-
-    Parameters
-    ----------
-    regime :
-        String value of the market regime (e.g. ``"BULLISH_TREND"``).
-    confidence :
-        Confidence score of the market regime in [0, 1].
-    """
     regime:     str   = "UNCERTAIN"
     confidence: float = 0.0
 
     @classmethod
     def from_dict(cls, d: dict) -> "MarketRegimeInput":
-        """Convenience constructor from the Market Regime Engine JSON output."""
         return cls(
             regime=d.get("regime", "UNCERTAIN"),
             confidence=float(d.get("confidence", 0.0)),
@@ -68,27 +48,27 @@ class MarketRegimeInput:
         return f"MarketRegimeInput(regime={self.regime!r}, confidence={self.confidence:.2f})"
 
 
-# ─────────────────────────────────────────────────────────────
-#  Indicator Snapshot (one bar per stock)
-# ─────────────────────────────────────────────────────────────
-
 @dataclass
 class StockIndicatorSnapshot:
     """
-    All computed indicator values for the most-recent bar of one stock.
+    All computed indicator values for one bar.
 
-    Optional fields gracefully degrade when insufficient history exists
-    (e.g. first 200 bars lack EMA-200, first 252 bars lack a full 52w high).
+    New fields added for continuous scoring and trend/momentum separation:
+    roc_10, roc_21, acceleration  — rate-of-change and momentum acceleration
+    rs_1m, rs_3m, rs_6m           — multi-period relative strength
+    rs_trend                       — slope of rs_3m (improving vs weakening)
+    higher_highs_count             — trend quality (count of higher highs)
+    ema_distance_pct               — (close - ema200) / ema200
     """
-    # Price
+    # Core
     close: float = float("nan")
 
-    # Exponential Moving Averages
+    # EMAs
     ema20:  Optional[float] = None
     ema50:  Optional[float] = None
     ema200: Optional[float] = None
 
-    # EMA slopes (% change over slope_window bars)
+    # EMA slopes
     ema20_slope: Optional[float] = None
     ema50_slope: Optional[float] = None
 
@@ -96,23 +76,36 @@ class StockIndicatorSnapshot:
     adx: Optional[float] = None
 
     # Volatility
-    atr:    Optional[float] = None   # current ATR
-    atr_ma: Optional[float] = None   # rolling mean of ATR
+    atr:    Optional[float] = None
+    atr_ma: Optional[float] = None
 
     # Volume
     volume:    Optional[float] = None
     volume_ma: Optional[float] = None
 
-    # Relative strength vs benchmark (ratio of returns)
-    # > 1.0 → outperforming; < 1.0 → underperforming; None → no benchmark
+    # Legacy RS (kept for compatibility)
     relative_strength: Optional[float] = None
 
-    # Rolling high proxy for near-high breakout detection
+    # Rolling high
     high_52w: Optional[float] = None
 
+    # NEW: Rate of change (momentum separation)
+    roc_10:       Optional[float] = None
+    roc_21:       Optional[float] = None
+    acceleration: Optional[float] = None   # roc_10 - roc_21
+
+    # NEW: Multi-period RS
+    rs_1m:   Optional[float] = None   # 21-bar
+    rs_3m:   Optional[float] = None   # 63-bar (replaces relative_strength going forward)
+    rs_6m:   Optional[float] = None   # 126-bar
+    rs_trend: Optional[float] = None  # slope of rs_3m over last N bars
+
+    # NEW: Trend quality
+    higher_highs_count: Optional[int]   = None
+    ema_distance_pct:   Optional[float] = None   # (close - ema200) / ema200
+
     def is_complete(self) -> bool:
-        """Return ``True`` only when every core field has a valid value."""
-        core_fields = [
+        core = [
             self.ema20, self.ema50, self.ema200,
             self.ema20_slope, self.ema50_slope,
             self.adx, self.atr, self.atr_ma,
@@ -120,11 +113,10 @@ class StockIndicatorSnapshot:
         ]
         return all(
             v is not None and not (isinstance(v, float) and math.isnan(v))
-            for v in core_fields
+            for v in core
         )
 
     def to_dict(self) -> dict:
-        """Serialise to plain dict for persistence / JSON output."""
         return {
             "close":              self.close,
             "ema20":              self.ema20,
@@ -139,55 +131,65 @@ class StockIndicatorSnapshot:
             "volume_ma":          self.volume_ma,
             "relative_strength":  self.relative_strength,
             "high_52w":           self.high_52w,
+            "roc_10":             self.roc_10,
+            "roc_21":             self.roc_21,
+            "acceleration":       self.acceleration,
+            "rs_1m":              self.rs_1m,
+            "rs_3m":              self.rs_3m,
+            "rs_6m":              self.rs_6m,
+            "rs_trend":           self.rs_trend,
+            "higher_highs_count": self.higher_highs_count,
+            "ema_distance_pct":   self.ema_distance_pct,
         }
 
 
-# ─────────────────────────────────────────────────────────────
-#  Signals (boolean flags derived from snapshot)
-# ─────────────────────────────────────────────────────────────
-
 @dataclass
 class StockSignals:
-    """
-    Human-readable boolean signals extracted from a StockIndicatorSnapshot.
-
-    Each field corresponds to one market condition consumed by the scorer.
-    Keeping signals separate from scores lets callers inspect *why* a regime
-    was assigned.
-    """
+    """Boolean signals. Extended with momentum and trend-quality signals."""
     # Trend direction
     price_above_ema200: bool = False
     price_below_ema200: bool = False
     ema20_above_ema50:  bool = False
     ema20_below_ema50:  bool = False
 
-    # EMA flatness (sideways / range detection)
+    # EMA flatness
     ema20_flat: bool = False
     ema50_flat: bool = False
 
     # Trend strength
-    adx_strong: bool = False   # ADX ≥ strong_trend threshold
-    adx_weak:   bool = False   # ADX < weak_trend threshold
+    adx_strong: bool = False
+    adx_weak:   bool = False
 
-    # Volatility regime
-    atr_high:       bool = False   # ATR/ATR_MA ≥ volatile_ratio
-    atr_low:        bool = False   # ATR/ATR_MA ≤ quiet_ratio
-    atr_compressed: bool = False   # ATR/ATR_MA ≤ compressed_ratio (setup)
-    atr_expanding:  bool = False   # ATR/ATR_MA > expanding_ratio
+    # Volatility
+    atr_high:       bool = False
+    atr_low:        bool = False
+    atr_compressed: bool = False
+    atr_expanding:  bool = False
 
     # Volume
-    volume_confirmed: bool = False  # volume ≥ vol_MA × surge_ratio
+    volume_confirmed: bool = False
 
-    # Relative strength
-    rs_positive: bool = False   # RS ≥ positive threshold
-    rs_negative: bool = False   # RS ≤ negative threshold
-    rs_strong:   bool = False   # RS ≥ strong threshold
+    # RS (legacy)
+    rs_positive: bool = False
+    rs_negative: bool = False
+    rs_strong:   bool = False
 
-    # Breakout location
-    price_near_52w_high: bool = False   # close within near_high_pct of high
+    # Breakout
+    price_near_52w_high: bool = False
+
+    # NEW: Momentum signals
+    roc_positive:     bool = False
+    roc_accelerating: bool = False
+
+    # NEW: RS improvement
+    rs_improving: bool = False
+    rs_weakening: bool = False
+
+    # NEW: Trend quality
+    higher_highs: bool = False
+    ema_extended: bool = False
 
     def to_dict(self) -> dict:
-        """Serialise to plain dict for persistence / JSON output."""
         return {
             "price_above_ema200":  self.price_above_ema200,
             "price_below_ema200":  self.price_below_ema200,
@@ -206,90 +208,98 @@ class StockSignals:
             "rs_negative":         self.rs_negative,
             "rs_strong":           self.rs_strong,
             "price_near_52w_high": self.price_near_52w_high,
+            "roc_positive":        self.roc_positive,
+            "roc_accelerating":    self.roc_accelerating,
+            "rs_improving":        self.rs_improving,
+            "rs_weakening":        self.rs_weakening,
+            "higher_highs":        self.higher_highs,
+            "ema_extended":        self.ema_extended,
         }
 
 
-# ─────────────────────────────────────────────────────────────
-#  Dimensional Scores (for ranking, not classification)
-# ─────────────────────────────────────────────────────────────
+@dataclass
+class ContinuousScores:
+    """
+    Continuous normalized component scores in [0, 1] computed directly
+    from raw indicator values — NOT from boolean signals.
+
+    These drive the dimensional scores so rankings have realistic gradient
+    rather than binary saturation (trend=1.0 / momentum=1.0 too often).
+
+    Calibration reference
+    ---------------------
+    adx_score:           0 at ADX=0,  0.5 at ADX=25, 1.0 at ADX=50
+    ema_alignment_score: 0.33 per bullish EMA pair (3 pairs total)
+    ema_distance_score:  0 at distance=0, 1.0 at distance=+20%  (capped)
+    atr_expansion_score: 0 at ratio=0.5,  0.5 at ratio=1.0, 1.0 at ratio=2.0
+    rs_score:            0 at RS=0.90,     0.5 at RS=1.0,   1.0 at RS=1.10
+    rs_trend_score:      0=falling,  0.5=flat,  1.0=strongly rising
+    roc_score:           0 at roc_10=-5%,  0.5 at 0%,       1.0 at +5%
+    volume_score:        0 at vol/vol_ma=0.5, 0.5 at 1.0,   1.0 at 2.0
+    """
+    adx_score:           float = 0.0
+    ema_alignment_score: float = 0.0
+    ema_distance_score:  float = 0.0
+    atr_expansion_score: float = 0.5   # neutral default
+    rs_score:            float = 0.5   # neutral default
+    rs_trend_score:      float = 0.5   # neutral default
+    roc_score:           float = 0.5   # neutral default
+    volume_score:        float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "adx_score":           round(self.adx_score,           4),
+            "ema_alignment_score": round(self.ema_alignment_score,  4),
+            "ema_distance_score":  round(self.ema_distance_score,   4),
+            "atr_expansion_score": round(self.atr_expansion_score,  4),
+            "rs_score":            round(self.rs_score,             4),
+            "rs_trend_score":      round(self.rs_trend_score,       4),
+            "roc_score":           round(self.roc_score,            4),
+            "volume_score":        round(self.volume_score,         4),
+        }
+
 
 @dataclass
 class DimensionalScores:
     """
-    Three orthogonal scores that describe a stock's current character.
-
-    These scores are computed separately from the regime classification
-    scores and are intended for ranking and downstream consumers
-    (strategy router, risk engine).
-
-    All scores are in [0, 1].
+    Three orthogonal scores [0, 1] for ranking. Now derived from
+    ContinuousScores — no longer binary-saturated.
     """
-    trend:      float = 0.0   # EMA alignment + ADX + RS; high = strong uptrend
-    momentum:   float = 0.0   # RS + volume + ADX + ATR expansion
-    volatility: float = 0.0   # ATR ratio normalised to [0, 1]
+    trend:      float = 0.0
+    momentum:   float = 0.0
+    volatility: float = 0.0
+    continuous: Optional[ContinuousScores] = field(default=None, compare=False)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "trend":      round(self.trend,      4),
             "momentum":   round(self.momentum,   4),
             "volatility": round(self.volatility, 4),
         }
+        if self.continuous is not None:
+            d["continuous"] = self.continuous.to_dict()
+        return d
 
-
-# ─────────────────────────────────────────────────────────────
-#  Final engine output (one per stock per run)
-# ─────────────────────────────────────────────────────────────
 
 @dataclass
 class StockRegimeResult:
-    """
-    Structured output returned by the engine for a single stock.
-
-    This object is the primary data contract between the Stock Regime
-    Engine and all downstream consumers (strategy router, signal engine,
-    risk engine, persistence layer).
-
-    Attributes
-    ----------
-    symbol :
-        Stock ticker / identifier.
-    market :
-        Universe label, e.g. ``"NIFTY500"`` or ``"SP500"``.
-    stock_regime :
-        The classified stock regime.
-    confidence :
-        Score of the winning regime in [0, 1], post-context adjustment.
-    dimensional_scores :
-        Trend / momentum / volatility scores for ranking.
-    regime_scores :
-        Raw weighted score for every regime (transparency).
-    signals :
-        Boolean flags that drove the classification.
-    indicators :
-        Raw computed indicator values (for inspection / persistence).
-    error :
-        Set to a non-empty string if processing failed for this stock.
-    """
-    symbol:            str
-    market:            str
-    stock_regime:      StockRegime
-    confidence:        float
-    dimensional_scores: DimensionalScores  = field(default_factory=DimensionalScores)
-    regime_scores:     dict[str, float]    = field(default_factory=dict)
-    signals:           StockSignals        = field(default_factory=StockSignals)
-    indicators:        StockIndicatorSnapshot = field(default_factory=StockIndicatorSnapshot)
-    error:             Optional[str]       = None
+    symbol:             str
+    market:             str
+    stock_regime:       StockRegime
+    confidence:         float
+    dimensional_scores: DimensionalScores      = field(default_factory=DimensionalScores)
+    regime_scores:      dict[str, float]       = field(default_factory=dict)
+    signals:            StockSignals           = field(default_factory=StockSignals)
+    indicators:         StockIndicatorSnapshot = field(default_factory=StockIndicatorSnapshot)
+    error:              Optional[str]          = None
 
     def is_valid(self) -> bool:
-        """Return ``True`` when the result was produced without error."""
         return self.error is None
 
     def to_dict(self) -> dict:
-        """Serialise to the public JSON contract."""
         snap = self.indicators
 
-        def _clean(v: Optional[float]) -> Optional[float]:
-            """Replace NaN / inf with None so json.dumps never chokes."""
+        def _clean(v):
             if v is None:
                 return None
             try:
@@ -313,5 +323,10 @@ class StockRegimeResult:
                 "adx":               _clean(snap.adx),
                 "atr":               _clean(snap.atr),
                 "relative_strength": _clean(snap.relative_strength),
+                "roc_10":            _clean(snap.roc_10),
+                "roc_21":            _clean(snap.roc_21),
+                "acceleration":      _clean(snap.acceleration),
+                "rs_3m":             _clean(snap.rs_3m),
+                "rs_trend":          _clean(snap.rs_trend),
             },
         }
