@@ -192,15 +192,15 @@ class AlgoTradingPipeline:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _run_universe(self, universe_name, universe_cfg, persist, max_symbols, sym_cfg):
-        from stock_regime.filters        import UniverseFilter
-        from stock_regime.quality        import DataQualityValidator
-        from stock_regime.stability      import RegimeStabiliser
-        from stock_regime.quality_engine import OpportunityQualityEngine
-        from stock_regime.analytics      import RegimeAnalytics
-        from stock_regime.breadth_engine import BreadthEngine
-        from stock_regime.sector_engine  import SectorEngine
-        from stock_regime.strategy_router import StrategyRouter
-        from stock_regime.src.models     import MarketRegimeInput
+        from stock_regime.filters.universe_filter        import UniverseFilter
+        from stock_regime.quality.validator              import DataQualityValidator
+        from stock_regime.stability.stabiliser           import RegimeStabiliser
+        from stock_regime.quality.opportunity_quality    import OpportunityQualityEngine
+        from stock_regime.analytics.regime_analytics     import RegimeAnalytics
+        from stock_regime.breadth_engine.breadth         import BreadthEngine
+        from stock_regime.sector_engine.sector           import SectorEngine
+        from stock_regime.strategy_router.router         import StrategyRouter
+        from stock_regime.src.models                     import MarketRegimeInput
 
         benchmark_symbol = universe_cfg["benchmark"]
         symbol_source    = universe_cfg["symbol_source"]
@@ -550,7 +550,7 @@ class AlgoTradingPipeline:
 
     def _build_engines(self):
         from trading_data import DataManager, DataManagerConfig
-        from market_regime.src import MarketRegimeEngine
+        from market_regime.src.engine import MarketRegimeEngine
         from stock_regime.src import StockRegimeEngine
 
         data_cfg   = self._cfg["data"]
