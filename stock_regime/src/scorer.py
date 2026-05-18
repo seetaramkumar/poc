@@ -1,17 +1,10 @@
 """
 stock_regime/src/scorer.py
 ============================
-Computes regime scores and dimensional scores.
-
-Changes from previous version
-------------------------------
-- score_regimes(): unchanged (binary signals drive classification — stable)
-- score_dimensions(): now uses ContinuousScores computed from raw indicator
-  values so trend/momentum have realistic gradient, not binary saturation
-- _build_continuous_scores(): new private method normalising raw indicators
-- Trend and momentum scores now use distinct indicator sets so rankings diverge:
-    Trend    = EMA alignment + ADX strength + EMA distance + RS level
-    Momentum = ROC + acceleration + RS trend direction + volume expansion
+Phase 1: VOLATILE scoring now requires volatile_instability (erratic behavior),
+         not just ATR expansion. atr_high alone no longer drives VOLATILE.
+Phase 2: RANGE scoring enhanced with range_bound, bb_compressed, ema_compressed.
+Phase 3: Market-context-aware confidence adjustment applied post-classification.
 """
 
 from __future__ import annotations
@@ -21,36 +14,27 @@ from typing import Optional
 
 from .config_loader import StockEngineConfig
 from .models import (
-    ContinuousScores,
-    DimensionalScores,
-    StockIndicatorSnapshot,
-    StockRegime,
-    StockSignals,
+    ContinuousScores, DimensionalScores,
+    MarketRegimeInput, StockIndicatorSnapshot,
+    StockRegime, StockSignals,
 )
 
 logger = logging.getLogger(__name__)
 
 
 class StockRegimeScorer:
-    """Computes regime confidence scores and dimensional scores."""
-
     def __init__(self, config: StockEngineConfig) -> None:
         self.cfg = config
 
-    # ──────────────────────────────────────────────────────────────
-    #  Regime classification scores (boolean — unchanged)
-    # ──────────────────────────────────────────────────────────────
+    # ── Regime scores (classification) ──────────────────────────────
 
     def score_regimes(self, signals: StockSignals) -> dict[StockRegime, float]:
-        """
-        Boolean dot-product scoring per regime. Unchanged from prior version —
-        regime classification stays deterministic and binary.
-        """
         sig = signals
         sc  = self.cfg.scoring
         i   = int
 
-        return {
+        scores: dict[StockRegime, float] = {
+
             StockRegime.TREND_UP: (
                 sc.trend_up.price_above_ema200 * i(sig.price_above_ema200) +
                 sc.trend_up.ema20_above_ema50  * i(sig.ema20_above_ema50)  +
@@ -58,6 +42,7 @@ class StockRegimeScorer:
                 sc.trend_up.rs_positive        * i(sig.rs_positive)        +
                 sc.trend_up.volume_confirmed   * i(sig.volume_confirmed)
             ),
+
             StockRegime.TREND_DOWN: (
                 sc.trend_down.price_below_ema200 * i(sig.price_below_ema200) +
                 sc.trend_down.ema20_below_ema50  * i(sig.ema20_below_ema50)  +
@@ -65,111 +50,89 @@ class StockRegimeScorer:
                 sc.trend_down.rs_negative        * i(sig.rs_negative)        +
                 sc.trend_down.volume_confirmed   * i(sig.volume_confirmed)
             ),
+
+            # Phase 2: RANGE now uses 5 signals instead of 4
             StockRegime.RANGE: (
-                sc.range.adx_weak   * i(sig.adx_weak)   +
-                sc.range.ema20_flat * i(sig.ema20_flat) +
-                sc.range.ema50_flat * i(sig.ema50_flat) +
-                sc.range.atr_low    * i(sig.atr_low)
+                sc.range.adx_weak       * i(sig.adx_weak)       +
+                sc.range.ema20_flat     * i(sig.ema20_flat)     +
+                sc.range.ema50_flat     * i(sig.ema50_flat)     +
+                sc.range.atr_low        * i(sig.atr_low)        +
+                sc.range.range_bound    * i(sig.range_bound)    +
+                sc.range.bb_compressed  * i(sig.bb_compressed)  +
+                sc.range.ema_compressed * i(sig.ema_compressed)
             ),
+
             StockRegime.MOMENTUM: (
                 sc.momentum.rs_strong        * i(sig.rs_strong)        +
                 sc.momentum.adx_strong       * i(sig.adx_strong)       +
                 sc.momentum.volume_confirmed * i(sig.volume_confirmed) +
                 sc.momentum.atr_expanding    * i(sig.atr_expanding)
             ),
+
             StockRegime.BREAKOUT_SETUP: (
                 sc.breakout_setup.atr_compressed      * i(sig.atr_compressed)      +
                 sc.breakout_setup.price_near_52w_high * i(sig.price_near_52w_high) +
                 sc.breakout_setup.volume_confirmed    * i(sig.volume_confirmed)
             ),
+
+            # Phase 1: VOLATILE now requires volatile_instability.
+            # atr_high alone is no longer sufficient — healthy trends
+            # have expanding ATR but are NOT volatile.
             StockRegime.VOLATILE: (
-                sc.volatile.atr_high   * i(sig.atr_high)   +
-                sc.volatile.adx_strong * i(sig.adx_strong)
+                sc.volatile.volatile_instability * i(sig.volatile_instability) +
+                sc.volatile.atr_high             * i(sig.atr_high)             +
+                sc.volatile.high_reversal_freq   * i(sig.high_reversal_freq)
             ),
+
             StockRegime.QUIET: (
                 sc.quiet.atr_low  * i(sig.atr_low)  +
                 sc.quiet.adx_weak * i(sig.adx_weak)
             ),
         }
 
-    # ──────────────────────────────────────────────────────────────
-    #  Dimensional scores (continuous — replaces binary version)
-    # ──────────────────────────────────────────────────────────────
+        return scores
+
+    # ── Dimensional scores (ranking) ────────────────────────────────
 
     def score_dimensions(
         self,
         signals: StockSignals,
         snap: Optional[StockIndicatorSnapshot] = None,
     ) -> DimensionalScores:
-        """
-        Compute trend, momentum, and volatility dimensional scores.
-
-        Now uses ContinuousScores derived from raw indicator values so that
-        results are realistically distributed across stocks rather than
-        saturating at 1.0 whenever most signals are True.
-
-        Trend and Momentum use distinct indicator sets so their rankings
-        naturally diverge:
-
-        TREND    = EMA structure + ADX + distance from macro trend + RS level
-        MOMENTUM = ROC/acceleration + RS trend direction + volume expansion + ATR
-
-        Parameters
-        ----------
-        signals : StockSignals
-            Boolean signals (still used for volatility score).
-        snap : StockIndicatorSnapshot
-            Raw indicator values used for continuous normalisation.
-        """
         cs = self._build_continuous_scores(snap) if snap is not None else ContinuousScores()
-
-        # ── TREND score ───────────────────────────────────────────────
-        # Measures directional persistence and structural alignment.
-        # Components: EMA alignment (structure), ADX (strength),
-        #             EMA distance (extension), RS level (leadership)
         dm = self.cfg.dimensional
+
+        # Trend: EMA structure + ADX + RS level
+        trend_w = (dm.trend.price_above_ema200 +
+                   dm.trend.ema20_above_ema50 * 0.6 +
+                   dm.trend.adx_strong +
+                   dm.trend.rs_positive)
         trend_score = (
             dm.trend.price_above_ema200 * cs.ema_alignment_score +
             dm.trend.ema20_above_ema50  * cs.ema_alignment_score * 0.6 +
             dm.trend.adx_strong         * cs.adx_score           +
             dm.trend.rs_positive        * cs.rs_score
-        )
-        # Re-normalise to [0, 1] (weights may sum > 1 after continuous mixing)
-        trend_w_sum = (
-            dm.trend.price_above_ema200 +
-            dm.trend.ema20_above_ema50  * 0.6 +
-            dm.trend.adx_strong +
-            dm.trend.rs_positive
-        )
-        if trend_w_sum > 0:
-            trend_score = trend_score / trend_w_sum
+        ) / max(trend_w, 1e-9)
 
-        # ── MOMENTUM score ────────────────────────────────────────────
-        # Measures acceleration and recent outperformance velocity.
-        # Components: ROC (price velocity), RS trend direction (improving),
-        #             volume expansion, ATR expansion (range breakout)
+        # Momentum: ROC + RS direction + volume + ATR expansion
+        mom_w = (dm.momentum.rs_strong + dm.momentum.volume_confirmed +
+                 dm.momentum.adx_strong + dm.momentum.atr_expanding)
         momentum_score = (
             dm.momentum.rs_strong        * cs.roc_score        +
             dm.momentum.volume_confirmed * cs.volume_score     +
             dm.momentum.adx_strong       * cs.rs_trend_score   +
             dm.momentum.atr_expanding    * cs.atr_expansion_score
-        )
-        mom_w_sum = (
-            dm.momentum.rs_strong +
-            dm.momentum.volume_confirmed +
-            dm.momentum.adx_strong +
-            dm.momentum.atr_expanding
-        )
-        if mom_w_sum > 0:
-            momentum_score = momentum_score / mom_w_sum
+        ) / max(mom_w, 1e-9)
 
-        # ── VOLATILITY score ──────────────────────────────────────────
-        # Raw ATR ratio normalised [0, 1]. Unchanged from prior version.
-        volatility_score = cs.atr_expansion_score
+        # Volatility: ATR expansion BUT penalised by instability
+        # A clean expanding ATR = healthy trend → lower volatility risk score
+        vol_raw = cs.atr_expansion_score
+        # If instability is high, boost vol score; if trend is clean, reduce it
+        instability_boost = cs.instability_score * 0.30
+        trend_penalty     = cs.ema_alignment_score * 0.15
+        volatility_score  = min(vol_raw + instability_boost - trend_penalty, 1.0)
 
-        # Clip all to [0, 1]
-        def _clip(v: float) -> float:
-            return round(min(max(v, 0.0), 1.0), 4)
+        def _clip(v): return round(min(max(v, 0.0), 1.0), 4)
 
         result = DimensionalScores(
             trend      = _clip(trend_score),
@@ -179,98 +142,152 @@ class StockRegimeScorer:
         )
 
         logger.debug(
-            "scores  trend=%.3f  momentum=%.3f  vol=%.3f  "
-            "[adx=%.2f  ema_align=%.2f  rs=%.2f  roc=%.2f]",
+            "scores trend=%.3f  mom=%.3f  vol=%.3f  "
+            "[adx=%.2f align=%.2f rs=%.2f roc=%.2f instab=%.2f ranging=%.2f]",
             result.trend, result.momentum, result.volatility,
-            cs.adx_score, cs.ema_alignment_score, cs.rs_score, cs.roc_score,
+            cs.adx_score, cs.ema_alignment_score, cs.rs_score,
+            cs.roc_score, cs.instability_score, cs.ranging_score,
         )
         return result
 
-    # ──────────────────────────────────────────────────────────────
-    #  Continuous score normalisation
-    # ──────────────────────────────────────────────────────────────
+    # ── Phase 3: Market-context-aware confidence adjustment ──────────
 
-    def _build_continuous_scores(
-        self, snap: StockIndicatorSnapshot
-    ) -> ContinuousScores:
+    def apply_market_context(
+        self,
+        regime_scores: dict[StockRegime, float],
+        market_regime: MarketRegimeInput,
+    ) -> dict[StockRegime, float]:
         """
-        Map raw indicator values to [0, 1] continuous component scores.
+        Soft probabilistic weighting of regime scores based on market regime.
 
-        All mappings are monotone functions calibrated to realistic ranges.
-        Values outside the calibrated range are clipped — never extrapolated.
+        Rules (all soft — no hard blocks):
+        - BEARISH market → reduce bullish scores slightly, boost bearish
+        - SIDEWAYS market → favour RANGE/QUIET, penalise trending
+        - BULLISH market → favour trending/momentum, mild range penalty
+        - VOLATILE market → boost VOLATILE score slightly
+
+        Adjustments are bounded ±15% to avoid overwhelming the raw signal.
         """
+        mr   = market_regime.regime
+        conf = market_regime.confidence  # scale adjustment by market confidence
+        adjusted = dict(regime_scores)
 
-        def _clip01(v: float) -> float:
-            return min(max(v, 0.0), 1.0)
+        def _adj(regime: StockRegime, factor: float) -> None:
+            if regime in adjusted:
+                delta = (factor - 1.0) * conf * 0.15
+                adjusted[regime] = min(max(adjusted[regime] + delta, 0.0), 1.0)
 
-        # ── ADX score ────────────────────────────────────────────────
-        # Linear: 0 at ADX=0, 0.5 at ADX=25, 1.0 at ADX=50
-        adx_score = 0.0
-        if snap.adx is not None:
-            adx_score = _clip01(snap.adx / 50.0)
+        if mr == "BEARISH_TREND":
+            _adj(StockRegime.TREND_UP,   0.85)  # slight headwind for bulls
+            _adj(StockRegime.MOMENTUM,   0.85)
+            _adj(StockRegime.TREND_DOWN, 1.15)  # tailwind for bears
+            _adj(StockRegime.VOLATILE,   1.10)
 
-        # ── EMA alignment score ──────────────────────────────────────
-        # 3 binary sub-components each worth 0.333:
-        #   close > EMA200, EMA20 > EMA50, EMA50 > EMA200
+        elif mr == "BULLISH_TREND":
+            _adj(StockRegime.TREND_UP,   1.10)
+            _adj(StockRegime.MOMENTUM,   1.10)
+            _adj(StockRegime.TREND_DOWN, 0.90)
+            _adj(StockRegime.RANGE,      0.90)
+
+        elif mr == "SIDEWAYS":
+            _adj(StockRegime.RANGE,      1.15)
+            _adj(StockRegime.QUIET,      1.10)
+            _adj(StockRegime.TREND_UP,   0.90)
+            _adj(StockRegime.MOMENTUM,   0.90)
+            _adj(StockRegime.BREAKOUT_SETUP, 0.85)
+
+        elif mr == "VOLATILE":
+            _adj(StockRegime.VOLATILE,   1.10)
+            _adj(StockRegime.TREND_UP,   0.92)
+            _adj(StockRegime.MOMENTUM,   0.92)
+
+        return adjusted
+
+    # ── Continuous score normalisation ──────────────────────────────
+
+    def _build_continuous_scores(self, snap: StockIndicatorSnapshot) -> ContinuousScores:
+        def _c(v): return min(max(v, 0.0), 1.0)
+
+        # ADX: 0→0, 25→0.5, 50→1.0
+        adx_score = _c(snap.adx / 50.0) if snap.adx is not None else 0.0
+
+        # EMA alignment
         ema_align = 0.0
-        if snap.close is not None and snap.ema200 is not None:
+        if snap.close  is not None and snap.ema200 is not None:
             ema_align += 0.40 if snap.close > snap.ema200 else 0.0
-        if snap.ema20 is not None and snap.ema50 is not None:
-            ema_align += 0.40 if snap.ema20 > snap.ema50 else 0.0
-        if snap.ema50 is not None and snap.ema200 is not None:
-            ema_align += 0.20 if snap.ema50 > snap.ema200 else 0.0
+        if snap.ema20  is not None and snap.ema50  is not None:
+            ema_align += 0.40 if snap.ema20  > snap.ema50  else 0.0
+        if snap.ema50  is not None and snap.ema200 is not None:
+            ema_align += 0.20 if snap.ema50  > snap.ema200 else 0.0
 
-        # ── EMA distance score ───────────────────────────────────────
-        # (close - EMA200) / EMA200 → normalised to [-20%, +20%] range
-        # Maps: -20% → 0.0, 0% → 0.5, +20% → 1.0
-        ema_dist_score = 0.5  # neutral default
-        if snap.ema_distance_pct is not None:
-            raw = snap.ema_distance_pct
-            ema_dist_score = _clip01((raw + 0.20) / 0.40)
+        # EMA distance: -20%→0, 0%→0.5, +20%→1.0
+        ema_dist = _c((snap.ema_distance_pct + 0.20) / 0.40) if snap.ema_distance_pct is not None else 0.5
 
-        # ── ATR expansion score ──────────────────────────────────────
-        # ratio = ATR / ATR_MA; maps: 0.5→0, 1.0→0.5, 2.0→1.0 (linear)
+        # ATR expansion: 0.5→0, 1.0→0.5, 2.0→1.0 (but NOT = instability)
         atr_score = 0.5
         if snap.atr is not None and snap.atr_ma is not None and snap.atr_ma > 0:
-            ratio     = snap.atr / snap.atr_ma
-            atr_score = _clip01((ratio - 0.5) / 1.5)
+            atr_score = _c((snap.atr / snap.atr_ma - 0.5) / 1.5)
 
-        # ── RS score (level) ─────────────────────────────────────────
-        # RS range [0.90, 1.10] → [0, 1]
-        # Use rs_3m preferentially; fall back to legacy relative_strength
-        rs_val = snap.rs_3m if snap.rs_3m is not None else snap.relative_strength
-        rs_score = 0.5  # neutral when no benchmark
-        if rs_val is not None:
-            rs_score = _clip01((rs_val - 0.90) / 0.20)
+        # RS level: 0.90→0, 1.00→0.5, 1.10→1.0
+        rs_val    = snap.rs_3m if snap.rs_3m is not None else snap.relative_strength
+        rs_score  = _c((rs_val - 0.90) / 0.20) if rs_val is not None else 0.5
 
-        # ── RS trend score (direction of RS change) ──────────────────
-        # rs_trend is a slope value; typical range [-0.005, +0.005]
-        # Maps: -0.005→0, 0→0.5, +0.005→1.0
-        rs_trend_score = 0.5  # neutral
-        if snap.rs_trend is not None:
-            rs_trend_score = _clip01((snap.rs_trend + 0.005) / 0.010)
+        # RS trend slope: -0.005→0, 0→0.5, +0.005→1.0
+        rs_trend  = _c((snap.rs_trend + 0.005) / 0.010) if snap.rs_trend is not None else 0.5
 
-        # ── ROC score (price velocity / momentum) ────────────────────
-        # roc_10 range [-5%, +5%] → [0, 1]
-        # Positive ROC = momentum building
-        roc_score = 0.5  # neutral
-        if snap.roc_10 is not None:
-            roc_score = _clip01((snap.roc_10 + 5.0) / 10.0)
+        # ROC: -5%→0, 0%→0.5, +5%→1.0
+        roc_score = _c((snap.roc_10 + 5.0) / 10.0) if snap.roc_10 is not None else 0.5
 
-        # ── Volume score ─────────────────────────────────────────────
-        # vol/vol_ma range [0.5, 2.0] → [0, 1]
+        # Volume ratio: 0.5→0, 1.0→0.5, 2.0→1.0
         vol_score = 0.0
         if snap.volume is not None and snap.volume_ma is not None and snap.volume_ma > 0:
-            ratio     = snap.volume / snap.volume_ma
-            vol_score = _clip01((ratio - 0.5) / 1.5)
+            vol_score = _c((snap.volume / snap.volume_ma - 0.5) / 1.5)
+
+        # ── Phase 1: Instability score ───────────────────────────────
+        # Composite of 4 instability metrics → [0, 1]
+        instab_components = []
+        if snap.candle_instability is not None:
+            # candle_instability: 1.0=normal, 1.5=moderate, 2.0=high
+            instab_components.append(_c((snap.candle_instability - 1.0) / 1.0))
+        if snap.reversal_frequency is not None:
+            # 0.4=normal random, 0.6=erratic, 0.8=chaotic
+            instab_components.append(_c((snap.reversal_frequency - 0.40) / 0.40))
+        if snap.gap_frequency is not None:
+            # 0.05=normal, 0.15=gappy, 0.30=very gappy
+            instab_components.append(_c(snap.gap_frequency / 0.30))
+        if snap.wickiness_score is not None:
+            # 0.30=trending candles, 0.55=mixed, 0.80=doji/reversal
+            instab_components.append(_c((snap.wickiness_score - 0.30) / 0.50))
+        instability_score = (
+            sum(instab_components) / len(instab_components)
+            if instab_components else 0.0
+        )
+
+        # ── Phase 2: Ranging score ───────────────────────────────────
+        ranging_components = []
+        if snap.directional_efficiency is not None:
+            # DER: 0=ranging, 1=trending → invert for ranging score
+            ranging_components.append(1.0 - snap.directional_efficiency)
+        if snap.bb_width is not None:
+            # bb_width: 0.02=very tight, 0.05=normal, 0.10=wide
+            ranging_components.append(_c(1.0 - snap.bb_width / 0.10))
+        if snap.ema_spread is not None:
+            # |ema_spread|: 0=compressed, 0.01=normal, 0.03=diverged
+            ranging_components.append(_c(1.0 - abs(snap.ema_spread) / 0.03))
+        ranging_score = (
+            sum(ranging_components) / len(ranging_components)
+            if ranging_components else 0.0
+        )
 
         return ContinuousScores(
-            adx_score           = round(adx_score,       4),
-            ema_alignment_score = round(ema_align,        4),
-            ema_distance_score  = round(ema_dist_score,   4),
-            atr_expansion_score = round(atr_score,        4),
-            rs_score            = round(rs_score,         4),
-            rs_trend_score      = round(rs_trend_score,   4),
-            roc_score           = round(roc_score,        4),
-            volume_score        = round(vol_score,        4),
+            adx_score           = round(adx_score,           4),
+            ema_alignment_score = round(ema_align,            4),
+            ema_distance_score  = round(ema_dist,             4),
+            atr_expansion_score = round(atr_score,            4),
+            rs_score            = round(rs_score,             4),
+            rs_trend_score      = round(rs_trend,             4),
+            roc_score           = round(roc_score,            4),
+            volume_score        = round(vol_score,            4),
+            instability_score   = round(instability_score,    4),
+            ranging_score       = round(ranging_score,        4),
         )

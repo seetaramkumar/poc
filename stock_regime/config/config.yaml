@@ -1,216 +1,206 @@
-# ============================================================
-#  Stock Regime Engine — Configuration
-#  All numeric thresholds live here; no magic numbers in code.
-# ============================================================
-
 indicators:
   ema_periods:
     fast: 20
-    mid:  50
+    mid: 50
     slow: 200
-
-  adx_period:       14
-  atr_period:       14
+  adx_period: 14
+  atr_period: 14
   volume_ma_period: 20
-  rs_period:        63       # legacy single-period RS
-  high_period:      252      # rolling high window
-
-  # NEW: multi-period RS
+  rs_period: 63
+  high_period: 252
   rs_periods:
-    short:  21
+    short: 21
     medium: 63
-    long:   126
-  rs_trend_window: 10        # bars for RS slope calculation
-
+    long: 126
+  rs_trend_window: 10
 thresholds:
-  # ADX
   adx_strong_trend: 25.0
-  adx_weak_trend:   18.0
-
-  # ATR ratio
-  atr_ma_period:        20
-  atr_volatile_ratio:   1.30
-  atr_quiet_ratio:      0.70
+  adx_weak_trend: 18.0
+  atr_ma_period: 20
+  atr_volatile_ratio: 1.3
+  atr_quiet_ratio: 0.7
   atr_compressed_ratio: 0.75
-  atr_expanding_ratio:  1.00
-
-  # EMA slope
-  ema_slope_window:   5
+  atr_expanding_ratio: 1.0
+  ema_slope_window: 5
   ema_flat_threshold: 0.001
-
-  # Volume
-  volume_surge_ratio: 1.50
-
-  # Relative Strength
+  volume_surge_ratio: 1.5
   rs_positive_threshold: 1.02
   rs_negative_threshold: 0.98
-  rs_strong_threshold:   1.05
-  rs_trend_positive_threshold: 0.0005  # NEW: slope threshold for rs_improving
-
-  # Breakout
+  rs_strong_threshold: 1.05
+  rs_trend_positive_threshold: 0.0005
   near_high_pct: 0.03
-
-  # NEW: Momentum / ROC signals
-  acceleration_threshold: 0.5    # roc_10 - roc_21 > this → accelerating
-  roc_positive_min: 0.0          # roc_10 > 0 → price rising
-
-  # NEW: Trend quality
-  higher_highs_window:    20     # look-back bars for higher-highs count
-  higher_highs_min_count: 5      # count >= this → higher_highs signal True
-  ema_extended_pct:       0.10   # (close-ema200)/ema200 > 10% → extended
-
+  acceleration_threshold: 0.5
+  roc_positive_min: 0.0
+  higher_highs_window: 20
+  higher_highs_min_count: 5
+  ema_extended_pct: 0.1
+  volatility_instability_window: 20
+  candle_instability_threshold: 1.2
+  reversal_frequency_threshold: 0.55
+  gap_frequency_threshold: 0.15
+  gap_threshold_pct: 0.01
+  wickiness_threshold: 0.55
+  bb_period: 20
+  bb_std: 2.0
+  bb_narrow_threshold: 0.04
+  der_window: 14
+  der_range_threshold: 0.35
+  ema_compressed_threshold: 0.005
 scoring:
   trend_up:
     price_above_ema200: 0.25
-    ema20_above_ema50:  0.25
-    adx_strong:         0.20
-    rs_positive:        0.20
-    volume_confirmed:   0.10
-
+    ema20_above_ema50: 0.25
+    adx_strong: 0.2
+    rs_positive: 0.2
+    volume_confirmed: 0.1
   trend_down:
     price_below_ema200: 0.25
-    ema20_below_ema50:  0.25
-    adx_strong:         0.20
-    rs_negative:        0.20
-    volume_confirmed:   0.10
-
+    ema20_below_ema50: 0.25
+    adx_strong: 0.2
+    rs_negative: 0.2
+    volume_confirmed: 0.1
   range:
-    adx_weak:   0.35
-    ema20_flat: 0.25
-    ema50_flat: 0.25
-    atr_low:    0.15
-
+    adx_weak: 0.2
+    ema20_flat: 0.15
+    ema50_flat: 0.15
+    atr_low: 0.1
+    range_bound: 0.2
+    bb_compressed: 0.1
+    ema_compressed: 0.1
   momentum:
-    rs_strong:        0.35
-    adx_strong:       0.25
+    rs_strong: 0.35
+    adx_strong: 0.25
     volume_confirmed: 0.25
-    atr_expanding:    0.15
-
+    atr_expanding: 0.15
   breakout_setup:
-    atr_compressed:      0.35
+    atr_compressed: 0.35
     price_near_52w_high: 0.35
-    volume_confirmed:    0.30
-
+    volume_confirmed: 0.3
   volatile:
-    atr_high:   0.60
-    adx_strong: 0.40
-
+    volatile_instability: 0.5
+    atr_high: 0.3
+    high_reversal_freq: 0.2
   quiet:
-    atr_low:  0.65
+    atr_low: 0.65
     adx_weak: 0.35
-
-  min_confidence: 0.50
-
-# ── Dimensional scoring weights (continuous — NEW) ───────────────
+  min_confidence: 0.5
 dimensional_scores:
   trend:
-    price_above_ema200: 0.40   # mapped to ema_alignment_score
-    ema20_above_ema50:  0.20   # partial weight within ema_alignment
-    adx_strong:         0.25   # mapped to adx_score
-    rs_positive:        0.15   # mapped to rs_score
-
+    price_above_ema200: 0.4
+    ema20_above_ema50: 0.2
+    adx_strong: 0.25
+    rs_positive: 0.15
   momentum:
-    rs_strong:        0.35   # mapped to roc_score (price velocity)
-    volume_confirmed: 0.25   # mapped to volume_score
-    adx_strong:       0.25   # mapped to rs_trend_score (RS direction)
-    atr_expanding:    0.15   # mapped to atr_expansion_score
-
-# ── Market context alignment ─────────────────────────────────────
+    rs_strong: 0.35
+    volume_confirmed: 0.25
+    adx_strong: 0.25
+    atr_expanding: 0.15
 market_context:
-  alignment_boost:      1.10
-  misalignment_penalty: 0.90
+  alignment_boost: 1.1
+  misalignment_penalty: 0.9
   aligned_regimes:
-    BULLISH_TREND:  ["TREND_UP", "MOMENTUM", "BREAKOUT_SETUP"]
-    BEARISH_TREND:  ["TREND_DOWN", "VOLATILE"]
-    SIDEWAYS:       ["RANGE", "QUIET"]
-    VOLATILE:       ["VOLATILE", "BREAKOUT_SETUP"]
-    QUIET:          ["QUIET", "RANGE"]
-    UNCERTAIN:      []
-
-# ── Ranking ──────────────────────────────────────────────────────
+    BULLISH_TREND:
+    - TREND_UP
+    - MOMENTUM
+    - BREAKOUT_SETUP
+    BEARISH_TREND:
+    - TREND_DOWN
+    - VOLATILE
+    SIDEWAYS:
+    - RANGE
+    - QUIET
+    VOLATILE:
+    - VOLATILE
+    - BREAKOUT_SETUP
+    QUIET:
+    - QUIET
+    - RANGE
+    UNCERTAIN: []
 ranking:
   top_n: 50
   opportunity_scoring:
-    trend_weight:      0.30
-    momentum_weight:   0.25
-    stability_weight:  0.25
-    low_vol_weight:    0.20
+    trend_weight: 0.3
+    momentum_weight: 0.25
+    stability_weight: 0.25
+    low_vol_weight: 0.2
     min_regime_age_for_full_score: 5
     regime_penalties:
       UNCERTAIN: 0.0
-      VOLATILE:  0.5
-      QUIET:     0.6
-
-# ── Universe Filters ─────────────────────────────────────────────
+      VOLATILE: 0.5
+      QUIET: 0.6
 filters:
   history:
-    min_bars:             300      # raised from 220 — enforces strict history
-    max_gap_days:         5
-    max_stale_days:       3
-    gap_lookback_days:    90
-
+    min_bars: 300
+    max_gap_days: 5
+    max_stale_days: 3
+    gap_lookback_days: 90
   price:
-    circuit_lookback_days:  90
-    max_circuit_days:        3
-    circuit_is_fatal:     false
+    circuit_lookback_days: 90
+    max_circuit_days: 3
+    circuit_is_fatal: false
     NSE:
-      min_price_inr:     50.0
-      max_price_inr:     null
+      min_price_inr: 50.0
+      max_price_inr: null
     NYSE:
-      min_price_usd:      2.0
-      max_price_usd:     null
+      min_price_usd: 2.0
+      max_price_usd: null
     NASDAQ:
-      min_price_usd:      2.0
-      max_price_usd:     null
-
+      min_price_usd: 2.0
+      max_price_usd: null
   liquidity:
     NSE:
-      min_adv_cr:              50.0
-      adv_period:              20
-      max_zero_volume_ratio:   0.05
-      max_volume_cv:           5.0
+      min_adv_cr: 50.0
+      adv_period: 20
+      max_zero_volume_ratio: 0.05
+      max_volume_cv: 5.0
     NYSE:
-      min_adv_usd_mn:          5.0
-      adv_period:              20
-      max_zero_volume_ratio:   0.05
-      max_volume_cv:           5.0
+      min_adv_usd_mn: 5.0
+      adv_period: 20
+      max_zero_volume_ratio: 0.05
+      max_volume_cv: 5.0
     NASDAQ:
-      min_adv_usd_mn:          5.0
-      adv_period:              20
-      max_zero_volume_ratio:   0.05
-      max_volume_cv:           5.0
-
+      min_adv_usd_mn: 5.0
+      adv_period: 20
+      max_zero_volume_ratio: 0.05
+      max_volume_cv: 5.0
   high_rejection_warning_pct: 30.0
-
-# ── Data Quality ─────────────────────────────────────────────────
 quality:
-  fatal_spike_pct:    0.60
-  warn_spike_pct:     0.20
-  zero_volume_fill:   true
-
-# ── Regime Stability ─────────────────────────────────────────────
+  fatal_spike_pct: 0.6
+  warn_spike_pct: 0.2
+  zero_volume_fill: true
 stability:
-  confirmation_bars:      3
-  uncertain_propagates:   false
-
-  # NEW: confidence smoothing and hysteresis
-  smoothing_enabled:      true
-  smoothing_alpha:        0.30    # EWM alpha: lower = smoother
-  hysteresis_threshold:   0.05    # new regime needs score > current + this
-  persistence_window:     5       # bars to check for oscillation detection
-  regime_switch_threshold: 0.55   # min smoothed confidence to switch regime
-
-# ── Opportunity Quality Engine (NEW) ─────────────────────────────
+  confirmation_bars: 3
+  uncertain_propagates: false
+  smoothing_enabled: true
+  smoothing_alpha: 0.3
+  hysteresis_threshold: 0.05
+  persistence_window: 5
+  regime_switch_threshold: 0.55
 quality_engine:
   weights:
-    liquidity:   0.25
+    liquidity: 0.25
     trend_clean: 0.25
-    vol_health:  0.20
-    stability:   0.20
-    tradability: 0.10
-  min_quality_score: 0.50
-
-# ── Score Distribution Logging ────────────────────────────────────
+    vol_health: 0.2
+    stability: 0.2
+    tradability: 0.1
+  min_quality_score: 0.5
 score_diagnostics:
   persist_distributions: true
-  log_top_percentile: 90   # log stocks above this percentile in each score
+  log_top_percentile: 90
+breadth_engine:
+  extreme_threshold: 75.0
+  expanding_threshold: 55.0
+  contracting_threshold: 45.0
+sector_engine:
+  leading_threshold: 60.0
+  lagging_threshold: 40.0
+strategy_router:
+  min_quality_for_trade: 0.45
+  min_confidence_for_trade: 0.52
+  min_quality_for_full_size: 0.65
+  adverse_breadth_states:
+  - EXTREME_DOWN
+  - CONTRACTING
+  adverse_market_regimes:
+  - VOLATILE
+  - UNCERTAIN

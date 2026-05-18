@@ -3,14 +3,18 @@ stock_regime/src/indicators.py
 ================================
 Computes all technical indicators from a normalised OHLCV DataFrame.
 
-Changes from previous version
-------------------------------
-- Added ROC-10, ROC-21, acceleration (momentum separation)
-- Added multi-period RS: rs_1m (21-bar), rs_3m (63-bar), rs_6m (126-bar)
-- Added rs_trend: rolling slope of rs_3m over rs_trend_window bars
-- Added higher_highs_count: trend quality metric
-- Added ema_distance_pct: normalised distance of close from EMA-200
-- legacy relative_strength field still populated from rs_3m for compatibility
+Changes in this version
+------------------------
+Phase 1 — Volatility fix:
+  candle_instability    : mean |return| / ATR ratio (erratic = high)
+  reversal_frequency    : fraction of bars where direction reversed
+  gap_frequency         : fraction of bars with open gap > threshold
+  wickiness_score       : mean wick-to-range ratio (indecision / rejection)
+
+Phase 2 — Range detection:
+  bb_width              : Bollinger Band width (close normalised)
+  directional_efficiency: ROC over N bars / sum of |daily returns| (0=ranging, 1=trending)
+  ema_spread            : (ema20 - ema50) / close — compressed when near 0
 """
 
 from __future__ import annotations
@@ -31,8 +35,6 @@ logger = logging.getLogger(__name__)
 
 
 class StockIndicatorCalculator:
-    """Calculates all technical indicators for the Stock Regime Engine."""
-
     def __init__(self, config: StockEngineConfig) -> None:
         self.cfg = config
 
@@ -44,13 +46,9 @@ class StockIndicatorCalculator:
     ) -> StockIndicatorSnapshot:
         df = self._normalise_columns(df)
         self._validate(df)
-        enriched = self._add_indicators(df)
+        enriched   = self._add_indicators(df)
         rs_profile = self._compute_rs_profile(df, benchmark_df, row_index)
         return self._extract_snapshot(enriched, row_index, rs_profile)
-
-    # ──────────────────────────────────────────────────────────────
-    #  Private helpers
-    # ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -60,17 +58,15 @@ class StockIndicatorCalculator:
 
     def _validate(self, df: pd.DataFrame) -> None:
         required = {"open", "high", "low", "close", "volume"}
-        missing = required - set(df.columns)
+        missing  = required - set(df.columns)
         if missing:
             raise ValueError(f"DataFrame is missing required columns: {missing}")
-
         min_bars = max(self.cfg.ema_slow, self.cfg.high_period) + 30
         if len(df) < min_bars:
             warnings.warn(
                 f"Only {len(df)} rows supplied; {min_bars} recommended. "
                 "Some indicators may be NaN.",
-                UserWarning,
-                stacklevel=5,
+                UserWarning, stacklevel=5,
             )
 
     def _add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -82,7 +78,6 @@ class StockIndicatorCalculator:
         df[f"ema{cfg.ema_mid}"]   = ta.ema(df["close"], length=cfg.ema_mid)
         df[f"ema{cfg.ema_slow}"]  = ta.ema(df["close"], length=cfg.ema_slow)
 
-        # ── EMA slopes ──────────────────────────────────────────────
         w = int(thr.ema_slope_window)
         df["ema20_slope"] = df[f"ema{cfg.ema_fast}"].pct_change(w)
         df["ema50_slope"] = df[f"ema{cfg.ema_mid}"].pct_change(w)
@@ -102,184 +97,176 @@ class StockIndicatorCalculator:
         # ── Rolling high ────────────────────────────────────────────
         df["high_52w"] = df["close"].rolling(window=cfg.high_period, min_periods=50).max()
 
-        # ── NEW: Rate of Change ──────────────────────────────────────
-        # ROC = (close / close[n bars ago] - 1) × 100  (percentage)
-        df["roc_10"] = df["close"].pct_change(10) * 100
-        df["roc_21"] = df["close"].pct_change(21) * 100
-        # Acceleration: positive = momentum building, negative = decelerating
-        df["acceleration"] = df["roc_10"] - df["roc_21"]
+        # ── ROC / acceleration ──────────────────────────────────────
+        df["roc_10"]      = df["close"].pct_change(10) * 100
+        df["roc_21"]      = df["close"].pct_change(21) * 100
+        df["acceleration"]= df["roc_10"] - df["roc_21"]
 
-        # ── NEW: EMA distance from macro trend ───────────────────────
-        ema200_col = f"ema{cfg.ema_slow}"
-        ema200     = df[ema200_col]
+        # ── EMA distance ────────────────────────────────────────────
+        ema200 = df[f"ema{cfg.ema_slow}"]
         df["ema_distance_pct"] = (df["close"] - ema200) / ema200.replace(0, pd.NA)
 
-        # ── NEW: Higher highs count (trend quality) ──────────────────
-        # Count how many of the last higher_highs_window bars made a new
-        # rolling high relative to the bar before them.
+        # ── Higher highs ────────────────────────────────────────────
         hh_window = int(getattr(thr, "higher_highs_window", 20))
         rolling_high_prev = df["high"].shift(1).rolling(hh_window, min_periods=5).max()
-        df["is_higher_high"] = (df["high"] > rolling_high_prev).astype(int)
-        df["higher_highs_count"] = (
-            df["is_higher_high"].rolling(hh_window, min_periods=5).sum()
+        df["is_higher_high"]      = (df["high"] > rolling_high_prev).astype(int)
+        df["higher_highs_count"]  = df["is_higher_high"].rolling(hh_window, min_periods=5).sum()
+
+        # ────────────────────────────────────────────────────────────
+        # PHASE 1: Volatility quality indicators
+        # ────────────────────────────────────────────────────────────
+        vi_window = int(getattr(thr, "volatility_instability_window", 20))
+        returns   = df["close"].pct_change()
+
+        # candle_instability: mean |return| relative to ATR baseline.
+        # A strong trend has big moves in ONE direction → low instability.
+        # An erratic market has big moves in BOTH directions → high.
+        abs_ret = returns.abs()
+        df["candle_instability"] = (
+            abs_ret.rolling(vi_window, min_periods=5).mean() /
+            (df["atr"] / df["close"].replace(0, pd.NA)).rolling(vi_window, min_periods=5).mean()
         )
+
+        # reversal_frequency: fraction of bars where daily direction flipped.
+        # Trending stocks have low reversal_frequency.
+        direction    = returns.apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+        dir_change   = (direction != direction.shift(1)).astype(int)
+        df["reversal_frequency"] = dir_change.rolling(vi_window, min_periods=5).mean()
+
+        # gap_frequency: fraction of bars where |open - prev_close| > gap threshold.
+        gap_thr = float(getattr(thr, "gap_threshold_pct", 0.01))
+        prev_close = df["close"].shift(1)
+        gap_pct    = ((df["open"] - prev_close) / prev_close.replace(0, pd.NA)).abs()
+        df["gap_frequency"] = (gap_pct > gap_thr).astype(float).rolling(
+            vi_window, min_periods=5
+        ).mean()
+
+        # wickiness_score: mean (high - low - |close - open|) / (high - low + 1e-9)
+        # High wicks = rejection / indecision — hallmark of unstable markets.
+        body     = (df["close"] - df["open"]).abs()
+        total    = (df["high"] - df["low"]).replace(0, pd.NA)
+        wick_pct = (total - body) / total
+        df["wickiness_score"] = wick_pct.rolling(vi_window, min_periods=5).mean()
+
+        # ────────────────────────────────────────────────────────────
+        # PHASE 2: Range detection indicators
+        # ────────────────────────────────────────────────────────────
+        bb_period = int(getattr(thr, "bb_period", 20))
+        bb_std    = float(getattr(thr, "bb_std", 2.0))
+
+        # Bollinger Band width: (upper - lower) / middle
+        bb_mid   = df["close"].rolling(bb_period, min_periods=10).mean()
+        bb_s     = df["close"].rolling(bb_period, min_periods=10).std()
+        bb_upper = bb_mid + bb_std * bb_s
+        bb_lower = bb_mid - bb_std * bb_s
+        df["bb_width"] = (bb_upper - bb_lower) / bb_mid.replace(0, pd.NA)
+
+        # Directional efficiency ratio (DER): net ROC / cumulative |returns|
+        # 1.0 = perfectly trending; 0.0 = perfectly ranging
+        der_window = int(getattr(thr, "der_window", 14))
+        net_move   = (df["close"] - df["close"].shift(der_window)).abs()
+        path_len   = abs_ret.rolling(der_window, min_periods=5).sum() * df["close"].shift(der_window)
+        df["directional_efficiency"] = (net_move / path_len.replace(0, pd.NA)).clip(0, 1)
+
+        # EMA spread compression: (ema20 - ema50) / close
+        ema20 = df[f"ema{cfg.ema_fast}"]
+        ema50 = df[f"ema{cfg.ema_mid}"]
+        df["ema_spread"] = (ema20 - ema50) / df["close"].replace(0, pd.NA)
 
         return df
 
-    # ──────────────────────────────────────────────────────────────
-    #  Multi-period RS profile
-    # ──────────────────────────────────────────────────────────────
+    # ── Multi-period RS ──────────────────────────────────────────────
 
-    def _compute_rs_profile(
-        self,
-        df: pd.DataFrame,
-        benchmark_df: Optional[pd.DataFrame],
-        row_index: int,
-    ) -> dict[str, Optional[float]]:
-        """
-        Compute RS at three lookback periods and a rolling RS trend slope.
-
-        Returns dict with keys: rs_1m, rs_3m, rs_6m, rs_trend.
-        All None when no benchmark provided.
-        """
+    def _compute_rs_profile(self, df, benchmark_df, row_index):
         if benchmark_df is None:
             return {"rs_1m": None, "rs_3m": None, "rs_6m": None, "rs_trend": None}
-
         bench = benchmark_df.copy()
         bench.columns = [c.lower().strip() for c in bench.columns]
         if "close" not in bench.columns:
             return {"rs_1m": None, "rs_3m": None, "rs_6m": None, "rs_trend": None}
-
-        n_stock = len(df)
-        abs_idx  = row_index if row_index >= 0 else n_stock + row_index
-
-        periods  = {"rs_1m": 21, "rs_3m": 63, "rs_6m": 126}
-        result: dict[str, Optional[float]] = {}
-
-        for key, period in periods.items():
+        n      = len(df)
+        abs_idx= row_index if row_index >= 0 else n + row_index
+        result = {}
+        for key, period in {"rs_1m": 21, "rs_3m": 63, "rs_6m": 126}.items():
             result[key] = self._single_rs(df, bench, abs_idx, period)
-
-        # RS trend: linear slope of rs_3m over last rs_trend_window bars
         tw = int(getattr(self.cfg.indicators, "rs_trend_window", 10))
-        result["rs_trend"] = self._rs_slope(df, bench, abs_idx, period=63, window=tw)
-
+        result["rs_trend"] = self._rs_slope(df, bench, abs_idx, 63, tw)
         return result
 
-    def _single_rs(
-        self,
-        stock_df: pd.DataFrame,
-        bench_df: pd.DataFrame,
-        abs_idx: int,
-        period: int,
-    ) -> Optional[float]:
-        """RS = (stock_return / bench_return) over `period` bars."""
-        if abs_idx < period:
-            return None
-        abs_bench = min(abs_idx, len(bench_df) - 1)
-        if abs_bench < period:
-            return None
+    def _single_rs(self, stock_df, bench_df, abs_idx, period):
+        if abs_idx < period: return None
+        ab = min(abs_idx, len(bench_df) - 1)
+        if ab < period: return None
+        sn, sp = stock_df["close"].iloc[abs_idx], stock_df["close"].iloc[abs_idx - period]
+        bn, bp = bench_df["close"].iloc[ab],      bench_df["close"].iloc[ab - period]
+        if sp <= 0 or bp <= 0 or bn <= 0: return None
+        br = bn / bp
+        return round((sn / sp) / br, 4) if br > 0 else None
 
-        stock_now   = stock_df["close"].iloc[abs_idx]
-        stock_prev  = stock_df["close"].iloc[abs_idx - period]
-        bench_now   = bench_df["close"].iloc[abs_bench]
-        bench_prev  = bench_df["close"].iloc[abs_bench - period]
-
-        if stock_prev <= 0 or bench_prev <= 0 or bench_now <= 0:
-            return None
-
-        stock_ret = stock_now / stock_prev
-        bench_ret = bench_now / bench_prev
-        if bench_ret <= 0:
-            return None
-        return round(stock_ret / bench_ret, 4)
-
-    def _rs_slope(
-        self,
-        stock_df: pd.DataFrame,
-        bench_df: pd.DataFrame,
-        abs_idx: int,
-        period: int,
-        window: int,
-    ) -> Optional[float]:
-        """
-        Compute the linear slope of rs_3m over the last `window` bars.
-
-        Positive → RS improving (stock outperforming more over time)
-        Negative → RS weakening
-        """
+    def _rs_slope(self, stock_df, bench_df, abs_idx, period, window):
         rs_series = []
-        for lookback in range(window - 1, -1, -1):
-            idx = abs_idx - lookback
-            if idx < 0:
-                continue
-            rs = self._single_rs(stock_df, bench_df, idx, period)
-            if rs is not None:
-                rs_series.append(rs)
-
-        if len(rs_series) < max(window // 2, 3):
-            return None
-
+        for lb in range(window - 1, -1, -1):
+            idx = abs_idx - lb
+            if idx >= 0:
+                rs = self._single_rs(stock_df, bench_df, idx, period)
+                if rs is not None:
+                    rs_series.append(rs)
+        if len(rs_series) < max(window // 2, 3): return None
         n      = len(rs_series)
         xs     = list(range(n))
-        mean_x = sum(xs) / n
-        mean_y = sum(rs_series) / n
-        denom  = sum((x - mean_x) ** 2 for x in xs)
-        if denom == 0:
-            return 0.0
-        slope  = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, rs_series)) / denom
-        return round(slope, 6)
+        mx, my = sum(xs)/n, sum(rs_series)/n
+        denom  = sum((x - mx)**2 for x in xs)
+        return round(sum((x-mx)*(y-my) for x,y in zip(xs,rs_series))/denom, 6) if denom else 0.0
 
-    # ──────────────────────────────────────────────────────────────
-    #  Snapshot extraction
-    # ──────────────────────────────────────────────────────────────
+    # ── Snapshot extraction ──────────────────────────────────────────
 
-    def _extract_snapshot(
-        self,
-        df: pd.DataFrame,
-        row_index: int,
-        rs_profile: dict,
-    ) -> StockIndicatorSnapshot:
+    def _extract_snapshot(self, df, row_index, rs_profile):
         cfg = self.cfg
         row = df.iloc[row_index]
 
-        def _val(col: str) -> Optional[float]:
+        def _val(col):
             v = row.get(col, float("nan"))
-            if v is None:
-                return None
+            if v is None: return None
             try:
                 fv = float(v)
                 return None if math.isnan(fv) else fv
-            except (TypeError, ValueError):
-                return None
+            except: return None
 
-        def _int_val(col: str) -> Optional[int]:
+        def _int_val(col):
             v = _val(col)
             return int(v) if v is not None else None
 
         rs_3m = rs_profile.get("rs_3m")
-
         return StockIndicatorSnapshot(
-            close           = float(row["close"]),
-            ema20           = _val(f"ema{cfg.ema_fast}"),
-            ema50           = _val(f"ema{cfg.ema_mid}"),
-            ema200          = _val(f"ema{cfg.ema_slow}"),
-            ema20_slope     = _val("ema20_slope"),
-            ema50_slope     = _val("ema50_slope"),
-            adx             = _val("adx"),
-            atr             = _val("atr"),
-            atr_ma          = _val("atr_ma"),
-            volume          = _val("volume"),
-            volume_ma       = _val("volume_ma"),
-            relative_strength = rs_3m,   # backward-compatible alias
-            high_52w        = _val("high_52w"),
-            # New
-            roc_10          = _val("roc_10"),
-            roc_21          = _val("roc_21"),
-            acceleration    = _val("acceleration"),
-            rs_1m           = rs_profile.get("rs_1m"),
-            rs_3m           = rs_3m,
-            rs_6m           = rs_profile.get("rs_6m"),
-            rs_trend        = rs_profile.get("rs_trend"),
-            higher_highs_count = _int_val("higher_highs_count"),
-            ema_distance_pct   = _val("ema_distance_pct"),
+            close                = float(row["close"]),
+            ema20                = _val(f"ema{cfg.ema_fast}"),
+            ema50                = _val(f"ema{cfg.ema_mid}"),
+            ema200               = _val(f"ema{cfg.ema_slow}"),
+            ema20_slope          = _val("ema20_slope"),
+            ema50_slope          = _val("ema50_slope"),
+            adx                  = _val("adx"),
+            atr                  = _val("atr"),
+            atr_ma               = _val("atr_ma"),
+            volume               = _val("volume"),
+            volume_ma            = _val("volume_ma"),
+            relative_strength    = rs_3m,
+            high_52w             = _val("high_52w"),
+            roc_10               = _val("roc_10"),
+            roc_21               = _val("roc_21"),
+            acceleration         = _val("acceleration"),
+            rs_1m                = rs_profile.get("rs_1m"),
+            rs_3m                = rs_3m,
+            rs_6m                = rs_profile.get("rs_6m"),
+            rs_trend             = rs_profile.get("rs_trend"),
+            higher_highs_count   = _int_val("higher_highs_count"),
+            ema_distance_pct     = _val("ema_distance_pct"),
+            # Phase 1 — volatility instability
+            candle_instability   = _val("candle_instability"),
+            reversal_frequency   = _val("reversal_frequency"),
+            gap_frequency        = _val("gap_frequency"),
+            wickiness_score      = _val("wickiness_score"),
+            # Phase 2 — range detection
+            bb_width             = _val("bb_width"),
+            directional_efficiency = _val("directional_efficiency"),
+            ema_spread           = _val("ema_spread"),
         )

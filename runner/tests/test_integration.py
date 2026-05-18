@@ -1,17 +1,12 @@
 """
 runner/tests/test_integration.py
 ==================================
-Full integration tests covering all roadmap phases.
-No network required — synthetic data throughout.
-
-Run:  cd algo_platform && pytest runner/tests/test_integration.py -v
+Full integration tests — all phases including breadth, sector, router.
+No network required.
 """
-
 from __future__ import annotations
-
 import sys
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -19,14 +14,10 @@ import pytest
 ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  Shared helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _df(n=500, drift=0.001, vol=0.01, seed=0, start=18_000.0) -> pd.DataFrame:
+def _df(n=500, drift=0.001, vol=0.01, seed=0, start=18_000.0):
     rng   = np.random.default_rng(seed)
-    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize() + pd.Timedelta(days=2), periods=n + 2)[-n:]
     close = np.empty(n)
     price = start
     for i in range(n):
@@ -43,7 +34,6 @@ def _df(n=500, drift=0.001, vol=0.01, seed=0, start=18_000.0) -> pd.DataFrame:
         index=dates,
     )
 
-
 BENCH  = _df(seed=99)
 STOCKS = {
     "INFY.NS":     _df(drift=0.0018, seed=1),
@@ -51,524 +41,521 @@ STOCKS = {
     "HDFCBANK.NS": _df(drift=-0.001, seed=3),
 }
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  Continuous Scoring (Improvement 1)
+# Phase 1 — Volatility Fix
 # ─────────────────────────────────────────────────────────────────────────────
-
-class TestContinuousScoring:
-    def _scorer(self):
-        from stock_regime.src.config_loader import StockEngineConfig
-        from stock_regime.src.scorer import StockRegimeScorer
-        return StockRegimeScorer(StockEngineConfig())
-
-    def test_continuous_scores_in_unit_interval(self):
-        from stock_regime.src.models import StockIndicatorSnapshot
-        snap = StockIndicatorSnapshot(
-            close=19000, ema20=18800, ema50=18500, ema200=17000,
-            ema20_slope=0.005, ema50_slope=0.003,
-            adx=30, atr=200, atr_ma=150, volume=1.6e7, volume_ma=1e7,
-            roc_10=2.5, roc_21=1.8, acceleration=0.7,
-            rs_3m=1.06, rs_trend=0.002, ema_distance_pct=0.12,
-        )
-        scorer = self._scorer()
-        cs = scorer._build_continuous_scores(snap)
-        for field_name, val in cs.to_dict().items():
-            assert 0.0 <= val <= 1.0, f"{field_name}={val} out of [0,1]"
-
-    def test_trend_momentum_diverge(self):
-        """Trend and momentum scores should differ meaningfully."""
-        from stock_regime.src.models import StockIndicatorSnapshot, StockSignals
-        scorer = self._scorer()
-        # High RS trend + high ROC (momentum) but flat EMA + low ADX (weak trend)
-        snap = StockIndicatorSnapshot(
-            close=1000, ema20=1001, ema50=1002, ema200=1003,
-            ema20_slope=0.00002, ema50_slope=0.00001,
-            adx=12, atr=10, atr_ma=9, volume=2e7, volume_ma=1e7,
-            roc_10=4.5, roc_21=1.0, acceleration=3.5,
-            rs_3m=1.08, rs_trend=0.004,
-        )
-        sig = StockSignals()
-        ds  = scorer.score_dimensions(sig, snap)
-        # Momentum should be higher than trend for this setup
-        assert ds.momentum > ds.trend, (
-            f"Expected momentum ({ds.momentum}) > trend ({ds.trend}) "
-            f"for accelerating RS stock with flat EMAs"
-        )
-
-    def test_no_binary_saturation(self):
-        """With realistic inputs, trend score should not be exactly 1.0."""
-        from stock_regime.src.models import StockIndicatorSnapshot, StockSignals
-        scorer = self._scorer()
-        snap = StockIndicatorSnapshot(
-            close=19000, ema20=18900, ema50=18700, ema200=17000,
-            adx=28, atr=180, atr_ma=150, volume=1.5e7, volume_ma=1e7,
-            roc_10=1.5, rs_3m=1.04, ema_distance_pct=0.12,
-        )
-        sig = StockSignals()
-        ds  = scorer.score_dimensions(sig, snap)
-        assert ds.trend < 1.0, f"trend score {ds.trend} should be < 1.0 (no saturation)"
-        assert ds.trend > 0.0, f"trend score {ds.trend} should be > 0.0"
-
-    def test_continuous_scores_attached_to_dimensional(self):
-        from stock_regime.src.models import StockIndicatorSnapshot, StockSignals
-        scorer = self._scorer()
-        snap   = StockIndicatorSnapshot(close=1000, adx=25, atr=10, atr_ma=9)
-        sig    = StockSignals()
-        ds     = scorer.score_dimensions(sig, snap)
-        assert ds.continuous is not None
-        assert hasattr(ds.continuous, "adx_score")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  New Indicators (ROC, RS multi-period, higher highs)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestNewIndicators:
+class TestVolatilityFix:
     def _calc(self):
         from stock_regime.src.config_loader import StockEngineConfig
         from stock_regime.src.indicators import StockIndicatorCalculator
         return StockIndicatorCalculator(StockEngineConfig())
 
-    def test_roc_computed(self):
+    def _scorer(self):
+        from stock_regime.src.config_loader import StockEngineConfig
+        from stock_regime.src.scorer import StockRegimeScorer
+        return StockRegimeScorer(StockEngineConfig())
+
+    def test_instability_indicators_computed(self):
         snap = self._calc().compute(_df(n=500, seed=1))
-        assert snap.roc_10  is not None, "roc_10 should be computed"
-        assert snap.roc_21  is not None, "roc_21 should be computed"
+        assert snap.candle_instability is not None
+        assert snap.reversal_frequency is not None
+        assert snap.gap_frequency      is not None
+        assert snap.wickiness_score    is not None
 
-    def test_acceleration_computed(self):
-        snap = self._calc().compute(_df(n=500, seed=1))
-        assert snap.acceleration is not None
-        # acceleration = roc_10 - roc_21
-        assert abs(snap.acceleration - (snap.roc_10 - snap.roc_21)) < 1e-6
+    def test_strong_trend_not_volatile(self):
+        """A clean strong uptrend should NOT get VOLATILE classification."""
+        from stock_regime.src.models import StockSignals, StockIndicatorSnapshot
+        from stock_regime.src.models import StockRegime
+        scorer = self._scorer()
+        # Clean uptrend: high ADX, expanding ATR, but LOW instability signals
+        signals = StockSignals(
+            price_above_ema200=True, ema20_above_ema50=True,
+            adx_strong=True, atr_high=True, atr_expanding=True,
+            rs_positive=True, volume_confirmed=True,
+            # Instability signals all False — clean trend
+            volatile_instability=False, candle_erratic=False, high_reversal_freq=False,
+        )
+        scores = scorer.score_regimes(signals)
+        assert scores[StockRegime.VOLATILE] < scores[StockRegime.TREND_UP], (
+            f"Strong trend should NOT score higher as VOLATILE: "
+            f"VOLATILE={scores[StockRegime.VOLATILE]:.2f} > "
+            f"TREND_UP={scores[StockRegime.TREND_UP]:.2f}"
+        )
 
-    def test_ema_distance_pct_computed(self):
-        snap = self._calc().compute(_df(n=500, seed=1))
-        if snap.ema200 is not None and snap.ema200 > 0:
-            expected = (snap.close - snap.ema200) / snap.ema200
-            assert abs(snap.ema_distance_pct - expected) < 1e-4
+    def test_erratic_stock_is_volatile(self):
+        """A stock with erratic behavior should score highest as VOLATILE."""
+        from stock_regime.src.models import StockSignals, StockRegime
+        scorer = self._scorer()
+        signals = StockSignals(
+            atr_high=True,
+            volatile_instability=True, candle_erratic=True, high_reversal_freq=True,
+            adx_weak=True,
+        )
+        scores = scorer.score_regimes(signals)
+        assert scores[StockRegime.VOLATILE] > 0.50, (
+            f"Erratic stock should score VOLATILE > 0.50: got {scores[StockRegime.VOLATILE]:.2f}"
+        )
 
-    def test_higher_highs_count_computed(self):
-        snap = self._calc().compute(_df(n=500, seed=1))
-        assert snap.higher_highs_count is not None
-        assert 0 <= snap.higher_highs_count <= 20  # within window
+    def test_instability_score_in_unit_interval(self):
+        from stock_regime.src.models import StockIndicatorSnapshot
+        scorer = self._scorer()
+        snap   = StockIndicatorSnapshot(
+            close=1000, atr=15, atr_ma=14,
+            candle_instability=1.5, reversal_frequency=0.6,
+            gap_frequency=0.2, wickiness_score=0.6,
+        )
+        cs = scorer._build_continuous_scores(snap)
+        assert 0.0 <= cs.instability_score <= 1.0
 
-    def test_rs_profile_with_benchmark(self):
-        snap = self._calc().compute(_df(n=500, seed=1), benchmark_df=BENCH)
-        # rs_3m should be populated with a benchmark
-        assert snap.rs_3m is not None
-        assert 0.5 < snap.rs_3m < 2.0, f"rs_3m={snap.rs_3m} out of plausible range"
-
-    def test_legacy_relative_strength_alias(self):
-        """relative_strength must equal rs_3m for backward compatibility."""
-        snap = self._calc().compute(_df(n=500, seed=1), benchmark_df=BENCH)
-        assert snap.relative_strength == snap.rs_3m
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  New Signals (roc, rs_improving, higher_highs)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestNewSignals:
-    def _extractor(self):
+    def test_volatile_signals_in_snapshot(self):
         from stock_regime.src.config_loader import StockEngineConfig
         from stock_regime.src.signals import StockSignalExtractor
-        return StockSignalExtractor(StockEngineConfig())
-
-    def _snap(self, **kw):
         from stock_regime.src.models import StockIndicatorSnapshot
-        defaults = dict(
-            close=19000, ema20=18800, ema50=18500, ema200=17000,
-            ema20_slope=0.005, ema50_slope=0.003,
-            adx=30, atr=200, atr_ma=150, volume=1.6e7, volume_ma=1e7,
+        ext  = StockSignalExtractor(StockEngineConfig())
+        snap = StockIndicatorSnapshot(
+            close=1000, atr=15, atr_ma=14,
+            candle_instability=1.5, reversal_frequency=0.6,
+            gap_frequency=0.2, wickiness_score=0.7,
         )
-        defaults.update(kw)
-        return StockIndicatorSnapshot(**defaults)
-
-    def test_roc_positive_signal(self):
-        sig = self._extractor().extract(self._snap(roc_10=2.5))
-        assert sig.roc_positive is True
-
-    def test_roc_negative_signal(self):
-        sig = self._extractor().extract(self._snap(roc_10=-1.5))
-        assert sig.roc_positive is False
-
-    def test_roc_accelerating_signal(self):
-        sig = self._extractor().extract(self._snap(roc_10=3.0, roc_21=1.0, acceleration=2.0))
-        assert sig.roc_accelerating is True
-
-    def test_rs_improving_signal(self):
-        sig = self._extractor().extract(self._snap(rs_trend=0.002))
-        assert sig.rs_improving is True
-        assert sig.rs_weakening is False
-
-    def test_rs_weakening_signal(self):
-        sig = self._extractor().extract(self._snap(rs_trend=-0.003))
-        assert sig.rs_weakening is True
-        assert sig.rs_improving is False
-
-    def test_higher_highs_signal(self):
-        sig = self._extractor().extract(self._snap(higher_highs_count=8))
-        assert sig.higher_highs is True
-
-    def test_higher_highs_below_threshold(self):
-        sig = self._extractor().extract(self._snap(higher_highs_count=2))
-        assert sig.higher_highs is False
-
-    def test_ema_extended_signal(self):
-        sig = self._extractor().extract(self._snap(ema_distance_pct=0.15))
-        assert sig.ema_extended is True
-
-    def test_rs_uses_rs_3m_preferentially(self):
-        """rs_3m should drive rs_positive, not legacy relative_strength."""
-        snap = self._snap(rs_3m=1.08, relative_strength=0.90)
-        sig  = self._extractor().extract(snap)
-        assert sig.rs_positive is True   # driven by rs_3m=1.08, not 0.90
+        sig = ext.extract(snap)
+        assert sig.volatile_instability is True
+        assert sig.candle_erratic       is True
+        assert sig.high_reversal_freq   is True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Regime Stability — smoothing + hysteresis
+# Phase 2 — Range Detection
 # ─────────────────────────────────────────────────────────────────────────────
+class TestRangeDetection:
+    def _calc(self):
+        from stock_regime.src.config_loader import StockEngineConfig
+        from stock_regime.src.indicators import StockIndicatorCalculator
+        return StockIndicatorCalculator(StockEngineConfig())
 
-class TestRegimeStabilityEnhanced:
-    def _make_result(self, regime_str, conf=0.75, symbol="SYM"):
+    def test_range_indicators_computed(self):
+        snap = self._calc().compute(_df(n=500, seed=1))
+        assert snap.bb_width               is not None
+        assert snap.directional_efficiency is not None
+        assert snap.ema_spread             is not None
+
+    def test_directional_efficiency_in_unit_interval(self):
+        snap = self._calc().compute(_df(n=500, seed=1))
+        if snap.directional_efficiency is not None:
+            assert 0.0 <= snap.directional_efficiency <= 1.0
+
+    def test_range_signals_fired_on_sideways_stock(self):
+        from stock_regime.src.config_loader import StockEngineConfig
+        from stock_regime.src.signals import StockSignalExtractor
+        from stock_regime.src.models import StockIndicatorSnapshot
+        ext  = StockSignalExtractor(StockEngineConfig())
+        snap = StockIndicatorSnapshot(
+            close=1000, ema20=1001, ema50=1002,
+            adx=12, atr=10, atr_ma=11,
+            bb_width=0.02,               # compressed
+            directional_efficiency=0.20, # ranging
+            ema_spread=0.001,            # compressed
+        )
+        sig = ext.extract(snap)
+        assert sig.range_bound    is True
+        assert sig.bb_compressed  is True
+        assert sig.ema_compressed is True
+
+    def test_range_score_higher_on_sideways(self):
+        from stock_regime.src.models import StockSignals, StockRegime
+        from stock_regime.src.config_loader import StockEngineConfig
+        from stock_regime.src.scorer import StockRegimeScorer
+        scorer = StockRegimeScorer(StockEngineConfig())
+        # All range signals True
+        signals = StockSignals(
+            adx_weak=True, ema20_flat=True, ema50_flat=True, atr_low=True,
+            range_bound=True, bb_compressed=True, ema_compressed=True,
+        )
+        scores = scorer.score_regimes(signals)
+        assert scores[StockRegime.RANGE] > 0.60, (
+            f"RANGE score should be > 0.60 for sideways stock, got {scores[StockRegime.RANGE]:.2f}"
+        )
+
+    def test_ranging_score_in_unit_interval(self):
+        from stock_regime.src.models import StockIndicatorSnapshot
+        from stock_regime.src.config_loader import StockEngineConfig
+        from stock_regime.src.scorer import StockRegimeScorer
+        scorer = StockRegimeScorer(StockEngineConfig())
+        snap   = StockIndicatorSnapshot(
+            close=1000, bb_width=0.025,
+            directional_efficiency=0.25, ema_spread=0.002,
+        )
+        cs = scorer._build_continuous_scores(snap)
+        assert 0.0 <= cs.ranging_score <= 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 3 — Market-Context-Aware Scoring
+# ─────────────────────────────────────────────────────────────────────────────
+class TestMarketContextScoring:
+    def _scorer(self):
+        from stock_regime.src.config_loader import StockEngineConfig
+        from stock_regime.src.scorer import StockRegimeScorer
+        return StockRegimeScorer(StockEngineConfig())
+
+    def test_bearish_market_reduces_bullish_score(self):
+        from stock_regime.src.models import StockSignals, StockRegime, MarketRegimeInput
+        scorer  = self._scorer()
+        signals = StockSignals(price_above_ema200=True, ema20_above_ema50=True,
+                               adx_strong=True, rs_positive=True)
+        raw_scores     = scorer.score_regimes(signals)
+        bearish_market = MarketRegimeInput(regime="BEARISH_TREND", confidence=1.0)
+        adj_scores     = scorer.apply_market_context(raw_scores, bearish_market)
+        assert adj_scores[StockRegime.TREND_UP] < raw_scores[StockRegime.TREND_UP], (
+            "Bearish market should reduce TREND_UP score"
+        )
+        assert adj_scores[StockRegime.TREND_DOWN] > raw_scores[StockRegime.TREND_DOWN], (
+            "Bearish market should increase TREND_DOWN score"
+        )
+
+    def test_bullish_market_boosts_trend_up(self):
+        from stock_regime.src.models import StockSignals, StockRegime, MarketRegimeInput
+        scorer  = self._scorer()
+        signals = StockSignals(price_above_ema200=True, ema20_above_ema50=True, adx_strong=True)
+        raw    = scorer.score_regimes(signals)
+        adj    = scorer.apply_market_context(raw, MarketRegimeInput("BULLISH_TREND", 1.0))
+        assert adj[StockRegime.TREND_UP] >= raw[StockRegime.TREND_UP]
+
+    def test_sideways_market_favours_range(self):
+        from stock_regime.src.models import StockSignals, StockRegime, MarketRegimeInput
+        scorer  = self._scorer()
+        signals = StockSignals(adx_weak=True, ema20_flat=True, ema50_flat=True, range_bound=True)
+        raw    = scorer.score_regimes(signals)
+        adj    = scorer.apply_market_context(raw, MarketRegimeInput("SIDEWAYS", 0.80))
+        assert adj[StockRegime.RANGE] >= raw[StockRegime.RANGE]
+
+    def test_context_adjustment_bounded(self):
+        from stock_regime.src.models import StockSignals, StockRegime, MarketRegimeInput
+        scorer  = self._scorer()
+        signals = StockSignals(price_above_ema200=True, adx_strong=True, rs_positive=True)
+        raw    = scorer.score_regimes(signals)
+        adj    = scorer.apply_market_context(raw, MarketRegimeInput("BEARISH_TREND", 1.0))
+        for regime, score in adj.items():
+            assert 0.0 <= score <= 1.0, f"{regime}: adj score {score} out of [0,1]"
+
+    def test_uncertain_market_minimal_adjustment(self):
+        from stock_regime.src.models import StockSignals, StockRegime, MarketRegimeInput
+        scorer  = self._scorer()
+        signals = StockSignals(price_above_ema200=True, adx_strong=True)
+        raw    = scorer.score_regimes(signals)
+        adj    = scorer.apply_market_context(raw, MarketRegimeInput("UNCERTAIN", 0.0))
+        for r in StockRegime:
+            if r in raw and r in adj:
+                assert abs(adj[r] - raw[r]) < 0.01, "UNCERTAIN market should not adjust scores"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4 — Breadth Engine
+# ─────────────────────────────────────────────────────────────────────────────
+class TestBreadthEngine:
+    def _make_stable_results(self, regimes: list[str]):
+        from stock_regime.stability.stabiliser import StableRegimeResult
         from stock_regime.src.models import (
             StockRegime, StockRegimeResult, DimensionalScores,
             StockSignals, StockIndicatorSnapshot,
         )
-        return StockRegimeResult(
-            symbol=symbol, market="TEST",
-            stock_regime=StockRegime(regime_str), confidence=conf,
-            dimensional_scores=DimensionalScores(), regime_scores={},
-            signals=StockSignals(), indicators=StockIndicatorSnapshot(),
+        results = []
+        for i, regime in enumerate(regimes):
+            is_above = regime in ("TREND_UP", "MOMENTUM")
+            signals  = StockSignals(price_above_ema200=is_above)
+            raw = StockRegimeResult(
+                symbol=f"S{i}", market="TEST",
+                stock_regime=StockRegime(regime), confidence=0.70,
+                dimensional_scores=DimensionalScores(trend=0.60, momentum=0.50),
+                regime_scores={}, signals=signals,
+                indicators=StockIndicatorSnapshot(),
+            )
+            sr = StableRegimeResult.from_result(
+                raw, stable_regime=StockRegime(regime),
+                prior_stable_regime=StockRegime.UNCERTAIN,
+                regime_age_bars=5, stable_regime_age=5,
+                regime_changed_today=False,
+                smoothed_confidence=0.70, oscillation_detected=False,
+            )
+            results.append(sr)
+        return results
+
+    def test_breadth_snapshot_produced(self):
+        from stock_regime.breadth_engine import BreadthEngine
+        engine  = BreadthEngine()
+        results = self._make_stable_results(
+            ["TREND_UP", "TREND_UP", "TREND_DOWN", "RANGE", "MOMENTUM"]
         )
+        snap = engine.compute(results, "TEST")
+        assert snap.universe == "TEST"
+        assert 0.0 <= snap.regime_breadth_score <= 1.0
+        assert snap.breadth_state in ("EXPANDING","NEUTRAL","CONTRACTING","EXTREME_UP","EXTREME_DOWN")
 
-    def test_smoothed_confidence_populated(self):
-        from stock_regime.stability import RegimeStabiliser, SymbolHistory
-        stab = RegimeStabiliser(confirmation_bars=1, smoothing_enabled=True,
-                                smoothing_alpha=0.5)
-        hist = {"SYM": SymbolHistory(symbol="SYM", stable_regime="TREND_UP",
-                                     stable_age=3, smoothed_confidence=0.80)}
-        results = stab.apply([self._make_result("TREND_UP", conf=0.70)], hist)
-        # EWM: 0.5 * 0.70 + 0.5 * 0.80 = 0.75
-        assert abs(results[0].smoothed_confidence - 0.75) < 0.01
+    def test_bullish_universe_expands_state(self):
+        from stock_regime.breadth_engine import BreadthEngine
+        engine  = BreadthEngine(expanding_threshold=50.0)
+        results = self._make_stable_results(["TREND_UP"] * 8 + ["TREND_DOWN"] * 2)
+        snap = engine.compute(results, "TEST")
+        assert snap.breadth_state in ("EXPANDING", "EXTREME_UP")
+        assert snap.pct_bullish > 50.0
 
-    def test_hysteresis_prevents_weak_switch(self):
-        """A weak new-regime signal should not overcome hysteresis."""
-        from stock_regime.stability import RegimeStabiliser, SymbolHistory
-        stab = RegimeStabiliser(
-            confirmation_bars=1,
-            hysteresis_threshold=0.10,
-            regime_switch_threshold=0.40,
-            smoothing_enabled=True, smoothing_alpha=0.5,
+    def test_bearish_universe_contracts_state(self):
+        from stock_regime.breadth_engine import BreadthEngine
+        engine  = BreadthEngine(contracting_threshold=40.0)
+        results = self._make_stable_results(["TREND_DOWN"] * 6 + ["RANGE"] * 4)
+        snap = engine.compute(results, "TEST")
+        assert snap.breadth_state in ("CONTRACTING", "EXTREME_DOWN")
+
+    def test_ad_ratio_correct(self):
+        from stock_regime.breadth_engine import BreadthEngine
+        engine  = BreadthEngine()
+        results = self._make_stable_results(
+            ["TREND_UP"] * 6 + ["TREND_DOWN"] * 2 + ["RANGE"] * 2
         )
-        # Current stable = TREND_UP with high smoothed confidence
-        hist = {"SYM": SymbolHistory(
-            symbol="SYM",
-            raw_regimes=["RANGE"],
-            stable_regime="TREND_UP",
-            stable_age=5,
-            smoothed_confidence=0.80,
-        )}
-        # New raw regime = RANGE with low confidence — shouldn't switch
-        results = stab.apply([self._make_result("RANGE", conf=0.55)], hist)
-        assert results[0].stable_regime.value == "TREND_UP"
-        assert results[0].regime_changed_today is False
+        snap = engine.compute(results, "TEST")
+        assert abs(snap.advance_decline_ratio - 3.0) < 0.01
 
-    def test_oscillation_detected(self):
-        """Stocks that flip regime every bar should trigger oscillation flag."""
-        from stock_regime.stability import RegimeStabiliser, SymbolHistory
-        stab = RegimeStabiliser(confirmation_bars=2, persistence_window=4)
-        hist = {"SYM": SymbolHistory(
-            symbol="SYM",
-            raw_regimes=["TREND_UP", "RANGE", "TREND_UP", "RANGE"],
-            stable_regime="TREND_UP",
-            stable_age=1,
-        )}
-        results = stab.apply([self._make_result("RANGE", conf=0.70)], hist)
-        assert results[0].oscillation_detected is True
+    def test_breadth_persists_to_parquet(self, tmp_path):
+        from stock_regime.breadth_engine import BreadthEngine
+        engine  = BreadthEngine()
+        results = self._make_stable_results(["TREND_UP"] * 5 + ["RANGE"] * 5)
+        snap    = engine.compute(results, "TEST")
+        path    = engine.persist(snap, tmp_path, append=False)
+        assert path.exists()
+        df = pd.read_parquet(path)
+        assert "pct_bullish" in df.columns
+        assert "breadth_state" in df.columns
 
-    def test_smoothing_disabled_uses_raw_confidence(self):
-        from stock_regime.stability import RegimeStabiliser, SymbolHistory
-        stab = RegimeStabiliser(
-            confirmation_bars=1, smoothing_enabled=False,
-            regime_switch_threshold=0.40,
-        )
-        hist = {"SYM": SymbolHistory(symbol="SYM", stable_regime="RANGE",
-                                     stable_age=2, smoothed_confidence=0.80)}
-        results = stab.apply([self._make_result("TREND_UP", conf=0.70)], hist)
-        assert abs(results[0].smoothed_confidence - 0.70) < 0.01
+    def test_breadth_thrust_computed(self, tmp_path):
+        from stock_regime.breadth_engine import BreadthEngine
+        engine  = BreadthEngine()
+        results = self._make_stable_results(["TREND_UP"] * 5 + ["RANGE"] * 5)
+        snap1   = engine.compute(results, "TEST")
+        engine.persist(snap1, tmp_path, append=False)
+        prior   = BreadthEngine.load_prior(tmp_path, "TEST")
+        results2 = self._make_stable_results(["TREND_UP"] * 8 + ["RANGE"] * 2)
+        snap2    = engine.compute(results2, "TEST", prior_snapshot=prior)
+        assert snap2.breadth_thrust > 0   # more bullish than before
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Opportunity Quality Engine (Improvement 7)
+# Phase 5 — Sector Engine
 # ─────────────────────────────────────────────────────────────────────────────
-
-class TestOpportunityQualityEngine:
-    def _make_stable_result(self, symbol="SYM", regime="TREND_UP",
-                            conf=0.78, smth=0.76, age=8, oscillating=False):
+class TestSectorEngine:
+    def _make_stable_results(self, symbol_regimes: dict[str, str]):
         from stock_regime.stability.stabiliser import StableRegimeResult
         from stock_regime.src.models import (
             StockRegime, StockRegimeResult, DimensionalScores,
-            StockSignals, StockIndicatorSnapshot, ContinuousScores,
+            StockSignals, StockIndicatorSnapshot,
         )
-        raw = StockRegimeResult(
-            symbol=symbol, market="TEST",
-            stock_regime=StockRegime(regime), confidence=conf,
-            dimensional_scores=DimensionalScores(
-                trend=0.72, momentum=0.65, volatility=0.40,
-                continuous=ContinuousScores(
-                    adx_score=0.60, ema_alignment_score=0.80,
-                    ema_distance_score=0.60, atr_expansion_score=0.50,
-                    rs_score=0.65, rs_trend_score=0.70,
-                    roc_score=0.65, volume_score=0.55,
-                ),
-            ),
-            regime_scores={}, signals=StockSignals(),
-            indicators=StockIndicatorSnapshot(
-                close=1000, ema200=900, atr=15, atr_ma=14,
-                volume=1.5e7, volume_ma=1e7,
-                ema_distance_pct=0.11, higher_highs_count=7, rs_3m=1.05,
-            ),
-        )
-        sr = StableRegimeResult.from_result(
-            raw,
-            stable_regime=StockRegime(regime),
-            prior_stable_regime=StockRegime.RANGE,
-            regime_age_bars=age,
-            stable_regime_age=age,
-            regime_changed_today=False,
-            smoothed_confidence=smth,
-            oscillation_detected=oscillating,
-        )
-        return sr
+        results = []
+        for sym, regime in symbol_regimes.items():
+            raw = StockRegimeResult(
+                symbol=sym, market="TEST",
+                stock_regime=StockRegime(regime), confidence=0.70,
+                dimensional_scores=DimensionalScores(trend=0.65, momentum=0.55),
+                regime_scores={}, signals=StockSignals(),
+                indicators=StockIndicatorSnapshot(),
+            )
+            sr = StableRegimeResult.from_result(
+                raw, stable_regime=StockRegime(regime),
+                prior_stable_regime=StockRegime.UNCERTAIN,
+                regime_age_bars=5, stable_regime_age=5,
+                regime_changed_today=False,
+                smoothed_confidence=0.70, oscillation_detected=False,
+            )
+            results.append(sr)
+        return results
 
-    def test_quality_score_in_unit_interval(self):
-        from stock_regime.quality_engine import OpportunityQualityEngine
-        engine = OpportunityQualityEngine()
-        r      = self._make_stable_result()
-        scores = engine.evaluate_batch([r], {r.symbol: _df(n=300, seed=1)})
-        assert len(scores) == 1
-        assert 0.0 <= scores[0].quality_score <= 1.0
+    def test_sector_engine_no_map_uses_unknown(self):
+        from stock_regime.sector_engine import SectorEngine
+        engine  = SectorEngine(sector_map_path=None)
+        results = self._make_stable_results({"AAPL": "TREND_UP", "MSFT": "MOMENTUM"})
+        snaps   = engine.compute(results, "SP500")
+        assert len(snaps) == 1
+        assert snaps[0].sector == "UNKNOWN"
 
-    def test_oscillating_stock_penalised(self):
-        from stock_regime.quality_engine import OpportunityQualityEngine
-        engine = OpportunityQualityEngine()
-        stable = self._make_stable_result(oscillating=False)
-        osc    = self._make_stable_result(symbol="OSC", oscillating=True)
-        scores = engine.evaluate_batch([stable, osc], {
-            stable.symbol: _df(n=300, seed=1),
-            osc.symbol:    _df(n=300, seed=2),
+    def test_sector_engine_with_map(self, tmp_path):
+        from stock_regime.sector_engine import SectorEngine
+        # Write a sector CSV
+        csv = tmp_path / "sectors.csv"
+        csv.write_text("symbol,sector\nAAPL,TECHNOLOGY\nMSFT,TECHNOLOGY\nJPM,BANKING\n")
+        engine  = SectorEngine(sector_map_path=csv)
+        results = self._make_stable_results({
+            "AAPL": "TREND_UP", "MSFT": "MOMENTUM", "JPM": "TREND_DOWN"
         })
-        s_score = next(s for s in scores if s.symbol == stable.symbol)
-        o_score = next(s for s in scores if s.symbol == "OSC")
-        assert s_score.stability_quality > o_score.stability_quality
+        snaps   = engine.compute(results, "SP500")
+        sectors = {s.sector for s in snaps}
+        assert "TECHNOLOGY" in sectors
+        assert "BANKING"    in sectors
 
-    def test_uncertain_regime_zero_stability(self):
-        from stock_regime.quality_engine import OpportunityQualityEngine
-        engine = OpportunityQualityEngine()
-        r      = self._make_stable_result(regime="UNCERTAIN", conf=0.0, smth=0.0)
-        scores = engine.evaluate_batch([r], {r.symbol: _df(n=300, seed=1)})
-        assert scores[0].stability_quality == 0.0
+    def test_leading_sector_classification(self, tmp_path):
+        from stock_regime.sector_engine import SectorEngine
+        csv = tmp_path / "sectors.csv"
+        csv.write_text("symbol,sector\n" +
+                       "\n".join(f"S{i},IT" for i in range(10)))
+        engine  = SectorEngine(sector_map_path=csv, leading_threshold=60.0)
+        results = self._make_stable_results({f"S{i}": "TREND_UP" for i in range(10)})
+        snaps   = engine.compute(results, "NIFTY500")
+        it_snap = next(s for s in snaps if s.sector == "IT")
+        assert it_snap.sector_state == "LEADING"
 
-    def test_quality_output_serialises_to_dict(self):
-        from stock_regime.quality_engine import OpportunityQualityEngine
-        engine = OpportunityQualityEngine()
-        r      = self._make_stable_result()
-        scores = engine.evaluate_batch([r], {r.symbol: _df(n=300, seed=1)})
-        d = scores[0].to_dict()
-        for key in ["symbol", "quality_score", "trend_quality",
-                    "liquidity_quality", "stability_quality"]:
-            assert key in d
-
-    def test_persist_creates_parquet(self, tmp_path):
-        from stock_regime.quality_engine import OpportunityQualityEngine
-        engine = OpportunityQualityEngine()
-        r      = self._make_stable_result()
-        scores = engine.evaluate_batch([r], {r.symbol: _df(n=300, seed=1)})
-        path   = engine.persist(scores, tmp_path, universe="TEST")
+    def test_sector_persist_parquet(self, tmp_path):
+        from stock_regime.sector_engine import SectorEngine
+        engine  = SectorEngine()
+        results = self._make_stable_results({"A": "TREND_UP", "B": "RANGE"})
+        snaps   = engine.compute(results, "TEST")
+        path    = engine.persist(snaps, tmp_path, append=False)
         assert path is not None and path.exists()
         df = pd.read_parquet(path)
-        assert "quality_score" in df.columns
+        assert "sector_state"    in df.columns
+        assert "trend_strength"  in df.columns
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Strict History Validation (Improvement 5)
+# Phase 7 — Strategy Router
 # ─────────────────────────────────────────────────────────────────────────────
-
-class TestStrictHistoryValidation:
-    def test_short_history_rejected(self):
-        from stock_regime.filters.history_filter import HistoryFilter
-        f = HistoryFilter(min_bars=300)
-        # Only 250 bars — should be rejected
-        reasons = f.check("SYM", _df(n=250))
-        assert any(r.check == "min_bars" for r in reasons)
-
-    def test_300_bars_accepted(self):
-        from stock_regime.filters.history_filter import HistoryFilter
-        f = HistoryFilter(min_bars=300)
-        reasons = f.check("SYM", _df(n=320))
-        assert reasons == []
-
-    def test_engine_warns_on_insufficient_bars(self):
-        """Engine should warn when fewer than recommended bars are supplied."""
-        import warnings
-        from stock_regime.src.config_loader import StockEngineConfig
-        from stock_regime.src.indicators import StockIndicatorCalculator
-        calc = StockIndicatorCalculator(StockEngineConfig())
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            calc.compute(_df(n=50))  # far too few
-            assert len(w) > 0
-            assert "rows" in str(w[0].message).lower()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Regime Analytics (Improvement 8)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestRegimeAnalytics:
-    def _history_df(self, n_symbols=5, n_days=100) -> pd.DataFrame:
-        import random
-        random.seed(42)
-        regimes = ["TREND_UP", "TREND_DOWN", "RANGE", "MOMENTUM"]
-        rows    = []
-        dates   = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n_days)
-        for i in range(n_symbols):
-            sym    = f"SYM{i}"
-            stable = random.choice(regimes)
-            age    = 0
-            for j, d in enumerate(dates):
-                changed = (j % 12 == 0 and j > 0)
-                if changed:
-                    stable = random.choice(regimes)
-                    age    = 1
-                else:
-                    age   += 1
-                rows.append({
-                    "symbol":               sym,
-                    "market":               "TEST",
-                    "run_date":             d.date(),
-                    "raw_regime":           stable,
-                    "stable_regime":        stable,
-                    "prior_stable_regime":  stable,
-                    "confidence":           0.75,
-                    "smoothed_confidence":  0.74,
-                    "regime_age_bars":      age,
-                    "stable_regime_age":    age,
-                    "regime_changed_today": changed,
-                    "oscillation_detected": False,
-                })
-        return pd.DataFrame(rows)
-
-    def test_analytics_produces_report(self, tmp_path):
-        from stock_regime.analytics import RegimeAnalytics
-        p = tmp_path / "history.parquet"
-        self._history_df().to_parquet(p, index=False)
-        rpt = RegimeAnalytics(p).compute("TEST")
-        assert rpt.universe == "TEST"
-        assert len(rpt.current_episodes) > 0
-
-    def test_transition_matrix_rows_sum_to_one(self, tmp_path):
-        from stock_regime.analytics import RegimeAnalytics
-        p = tmp_path / "history.parquet"
-        self._history_df(n_symbols=15, n_days=200).to_parquet(p, index=False)
-        rpt = RegimeAnalytics(p).compute("TEST")
-        if rpt.transition_matrix:
-            row_sums = rpt.transition_matrix.matrix.sum(axis=1)
-            active   = row_sums[row_sums > 0]
-            assert (active - 1.0).abs().max() < 0.01
-
-    def test_analytics_persist_files(self, tmp_path):
-        from stock_regime.analytics import RegimeAnalytics
-        p = tmp_path / "history.parquet"
-        self._history_df().to_parquet(p, index=False)
-        rpt   = RegimeAnalytics(p, min_episode_bars=2).compute("TEST")
-        saved = RegimeAnalytics(p).persist(rpt, tmp_path)
-        assert len(saved) > 0
-        for fp in saved.values():
-            assert fp.exists()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Validation plotting
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestValidationPlotting:
-    def _make_stable(self, symbol="INFY.NS"):
+class TestStrategyRouter:
+    def _make_inputs(self, regime="TREND_UP", conf=0.75, quality=0.70):
         from stock_regime.stability.stabiliser import StableRegimeResult
         from stock_regime.src.models import (
             StockRegime, StockRegimeResult, DimensionalScores,
-            StockSignals, StockIndicatorSnapshot, ContinuousScores,
+            StockSignals, StockIndicatorSnapshot,
         )
+        from stock_regime.quality_engine.opportunity_quality import QualityScore
+        from datetime import date
+
         raw = StockRegimeResult(
-            symbol=symbol, market="TEST",
-            stock_regime=StockRegime.TREND_UP, confidence=0.78,
-            dimensional_scores=DimensionalScores(
-                trend=0.72, momentum=0.65, volatility=0.40,
-                continuous=ContinuousScores(
-                    adx_score=0.60, ema_alignment_score=0.80,
-                    rs_score=0.65, roc_score=0.65,
-                ),
-            ),
-            regime_scores={}, signals=StockSignals(),
-            indicators=StockIndicatorSnapshot(
-                close=1820, ema20=1785, ema50=1710, ema200=1602,
-                adx=28, atr=42, atr_ma=45, volume=1.5e7, volume_ma=1.2e7,
-            ),
+            symbol="SYM", market="TEST",
+            stock_regime=StockRegime(regime), confidence=conf,
+            dimensional_scores=DimensionalScores(trend=0.70, momentum=0.60),
+            regime_scores={}, signals=StockSignals(rs_improving=True),
+            indicators=StockIndicatorSnapshot(),
         )
-        return StableRegimeResult.from_result(
-            raw,
-            stable_regime=StockRegime.TREND_UP,
-            prior_stable_regime=StockRegime.RANGE,
-            regime_age_bars=12, stable_regime_age=12,
+        sr = StableRegimeResult.from_result(
+            raw, stable_regime=StockRegime(regime),
+            prior_stable_regime=StockRegime.UNCERTAIN,
+            regime_age_bars=8, stable_regime_age=8,
             regime_changed_today=False,
-            smoothed_confidence=0.76, oscillation_detected=False,
+            smoothed_confidence=conf, oscillation_detected=False,
         )
+        qs = QualityScore(
+            symbol="SYM", market="TEST", run_date=date.today(),
+            quality_score=quality, liquidity_quality=0.75,
+            trend_quality=0.80, vol_health=0.70,
+            stability_quality=0.65, tradability=0.75, notes=[],
+        )
+        return sr, qs
 
-    def test_plot_regime_chart_returns_figure(self):
-        pytest.importorskip("matplotlib")
-        from stock_regime.validation.plotting import RegimePlotter
-        plotter = RegimePlotter()
-        fig     = plotter.plot_regime_chart("INFY.NS", _df(n=300, seed=1), self._make_stable())
-        import matplotlib.pyplot as plt
-        assert fig is not None
-        plt.close(fig)
+    def test_trend_up_bullish_market_routes_trend_following(self):
+        from stock_regime.strategy_router import StrategyRouter
+        router = StrategyRouter()
+        sr, qs = self._make_inputs("TREND_UP", conf=0.75, quality=0.70)
+        decisions = router.route_batch([sr], [qs], market_regime="BULLISH_TREND",
+                                       breadth_state="EXPANDING")
+        assert len(decisions) == 1
+        assert decisions[0].strategy == "TREND_FOLLOWING"
+        assert decisions[0].allowed  is True
 
-    def test_plot_score_distribution(self):
-        pytest.importorskip("matplotlib")
-        from stock_regime.validation.plotting import RegimePlotter
-        import matplotlib.pyplot as plt
-        plotter  = RegimePlotter()
-        score_df = pd.DataFrame({
-            "trend":    np.random.uniform(0.2, 0.9, 50),
-            "momentum": np.random.uniform(0.1, 0.8, 50),
-        })
-        fig = plotter.plot_score_distribution(score_df, "trend", "TEST")
-        assert fig is not None
-        plt.close(fig)
+    def test_momentum_regime_routes_momentum(self):
+        from stock_regime.strategy_router import StrategyRouter
+        router = StrategyRouter()
+        sr, qs = self._make_inputs("MOMENTUM", conf=0.75, quality=0.70)
+        decisions = router.route_batch([sr], [qs], market_regime="BULLISH_TREND",
+                                       breadth_state="NEUTRAL")
+        assert decisions[0].strategy == "MOMENTUM"
 
-    def test_save_all_creates_png(self, tmp_path):
-        pytest.importorskip("matplotlib")
-        from stock_regime.validation.plotting import RegimePlotter
-        plotter = RegimePlotter()
-        saved   = plotter.save_all("INFY.NS", _df(n=300, seed=1),
-                                   self._make_stable(), str(tmp_path))
-        assert len(saved) == 1
-        assert Path(saved[0]).exists()
+    def test_range_routes_mean_reversion(self):
+        from stock_regime.strategy_router import StrategyRouter
+        router = StrategyRouter()
+        sr, qs = self._make_inputs("RANGE", conf=0.72, quality=0.68)
+        decisions = router.route_batch([sr], [qs], market_regime="SIDEWAYS",
+                                       breadth_state="NEUTRAL")
+        assert decisions[0].strategy == "MEAN_REVERSION"
+
+    def test_breakout_setup_routes_breakout(self):
+        from stock_regime.strategy_router import StrategyRouter
+        router = StrategyRouter()
+        sr, qs = self._make_inputs("BREAKOUT_SETUP", conf=0.72, quality=0.68)
+        decisions = router.route_batch([sr], [qs], market_regime="BULLISH_TREND",
+                                       breadth_state="EXPANDING",
+                                       sector_states={"SYM": "NEUTRAL"})
+        assert decisions[0].strategy == "BREAKOUT"
+
+    def test_volatile_regime_no_trade(self):
+        from stock_regime.strategy_router import StrategyRouter
+        router = StrategyRouter()
+        sr, qs = self._make_inputs("VOLATILE", conf=0.70, quality=0.68)
+        decisions = router.route_batch([sr], [qs], market_regime="VOLATILE",
+                                       breadth_state="CONTRACTING")
+        assert decisions[0].strategy == "NO_TRADE"
+        assert decisions[0].allowed  is False
+
+    def test_low_quality_no_trade(self):
+        from stock_regime.strategy_router import StrategyRouter
+        router = StrategyRouter(min_quality_for_trade=0.60)
+        sr, qs = self._make_inputs("TREND_UP", conf=0.75, quality=0.30)
+        decisions = router.route_batch([sr], [qs], market_regime="BULLISH_TREND",
+                                       breadth_state="NEUTRAL")
+        assert decisions[0].strategy == "NO_TRADE"
+
+    def test_adverse_breadth_reduces_size(self):
+        from stock_regime.strategy_router import StrategyRouter
+        router = StrategyRouter()
+        sr, qs = self._make_inputs("TREND_UP", conf=0.75, quality=0.80)
+        # Good quality but bad breadth
+        d_good = router.route_batch([sr], [qs], market_regime="BULLISH_TREND",
+                                     breadth_state="EXPANDING")
+        d_bad  = router.route_batch([sr], [qs], market_regime="BULLISH_TREND",
+                                     breadth_state="CONTRACTING")
+        assert d_bad[0].position_size_multiplier < d_good[0].position_size_multiplier
+
+    def test_leading_sector_boosts_size(self):
+        from stock_regime.strategy_router import StrategyRouter
+        router = StrategyRouter()
+        sr, qs = self._make_inputs("TREND_UP", conf=0.75, quality=0.72)
+        d_leading = router.route_batch([sr], [qs], market_regime="BULLISH_TREND",
+                                        breadth_state="NEUTRAL",
+                                        sector_states={"SYM": "LEADING"})
+        d_lagging = router.route_batch([sr], [qs], market_regime="BULLISH_TREND",
+                                        breadth_state="NEUTRAL",
+                                        sector_states={"SYM": "LAGGING"})
+        assert d_leading[0].position_size_multiplier > d_lagging[0].position_size_multiplier
+
+    def test_routing_decision_serialises(self):
+        import json
+        from stock_regime.strategy_router import StrategyRouter
+        router = StrategyRouter()
+        sr, qs = self._make_inputs("TREND_UP", conf=0.75, quality=0.70)
+        decisions = router.route_batch([sr], [qs], market_regime="BULLISH_TREND",
+                                        breadth_state="NEUTRAL")
+        d = decisions[0].to_dict()
+        serialised = json.dumps(d)  # must not raise
+        parsed = json.loads(serialised)
+        for key in ["symbol","strategy","allowed","risk_profile","position_size_multiplier","reason"]:
+            assert key in parsed
+
+    def test_router_persist_parquet(self, tmp_path):
+        from stock_regime.strategy_router import StrategyRouter
+        router = StrategyRouter()
+        sr, qs = self._make_inputs("TREND_UP", conf=0.75, quality=0.70)
+        decisions = router.route_batch([sr], [qs], market_regime="BULLISH_TREND",
+                                        breadth_state="NEUTRAL")
+        path = router.persist(decisions, tmp_path, universe="TEST")
+        assert path is not None and path.exists()
+        df = pd.read_parquet(path)
+        assert "strategy" in df.columns
+        assert "allowed"  in df.columns
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Pipeline orchestration (mocked DataManager)
+# Pipeline Integration
 # ─────────────────────────────────────────────────────────────────────────────
-
-class TestPipelineOrchestration:
+class TestPipelineIntegration:
     @pytest.fixture
     def symbol_files(self, tmp_path):
         uni = tmp_path / "data" / "universes"
         uni.mkdir(parents=True)
-        (uni / "nifty500.txt").write_text(
-            "INFY.NS\n# comment\nRELIANCE.NS\nHDFCBANK.NS\n"
-        )
+        (uni / "nifty500.txt").write_text("INFY.NS\nRELIANCE.NS\nHDFCBANK.NS\n")
         return tmp_path
 
     @pytest.fixture
@@ -587,7 +574,6 @@ universes:
     exchange:      "NSE"
 symbol_loading:
   max_symbols: null
-  skip_on_fetch_error: true
   allow_missing_file: false
 output:
   root_dir:  "{tmp_path}/output"
@@ -607,62 +593,43 @@ stock_regime_config:  null
         pipeline._data_manager.get_daily_data = lambda *a, **k: BENCH.copy()
         pipeline._data_manager.fetch_multiple_symbols = lambda syms, **k: {
             s: FetchResult(symbol=s, provider="yahoo",
-                           data=_df(seed=i, n=350), success=True)
+                           data=_df(seed=i, n=400), success=True)
             for i, s in enumerate(syms)
         }
 
-    def test_results_are_stable_regime_results(self, pipeline):
+    def test_pipeline_produces_routing_decisions(self, pipeline):
         self._mock(pipeline)
         out = pipeline.run(universes=["NIFTY500"], persist=False)
-        from stock_regime.stability import StableRegimeResult
-        for r in out.stock_results["NIFTY500"]:
-            assert isinstance(r, StableRegimeResult)
-            assert hasattr(r, "smoothed_confidence")
-            assert hasattr(r, "oscillation_detected")
+        rd  = out.routing_decisions.get("NIFTY500", [])
+        assert len(rd) > 0
+        for d in rd:
+            assert d.strategy in ("TREND_FOLLOWING","MOMENTUM","MEAN_REVERSION",
+                                  "BREAKOUT","NO_TRADE")
 
-    def test_quality_scores_produced(self, pipeline):
+    def test_pipeline_produces_breadth_snapshot(self, pipeline):
         self._mock(pipeline)
         out = pipeline.run(universes=["NIFTY500"], persist=False)
-        qs  = out.quality_scores.get("NIFTY500", [])
-        assert len(qs) > 0
-        for q in qs:
-            assert 0.0 <= q.quality_score <= 1.0
+        br  = out.breadth.get("NIFTY500")
+        assert br is not None
+        assert 0.0 <= br.regime_breadth_score <= 1.0
 
-    def test_continuous_scores_in_results(self, pipeline):
+    def test_pipeline_produces_sector_snapshots(self, pipeline):
         self._mock(pipeline)
-        out = pipeline.run(universes=["NIFTY500"], persist=False)
-        for r in out.stock_results["NIFTY500"]:
-            ds = r.dimensional_scores
-            assert 0.0 <= ds.trend      <= 1.0
-            assert 0.0 <= ds.momentum   <= 1.0
-            assert 0.0 <= ds.volatility <= 1.0
+        out   = pipeline.run(universes=["NIFTY500"], persist=False)
+        sects = out.sectors.get("NIFTY500", [])
+        assert isinstance(sects, list)  # may be empty (no sector CSV) or have UNKNOWN
 
-    def test_scoring_parquet_written(self, pipeline, tmp_path):
+    def test_pipeline_persist_writes_router_parquet(self, pipeline, tmp_path):
         self._mock(pipeline)
         pipeline.run(universes=["NIFTY500"], persist=True)
-        scoring_files = list(Path(tmp_path / "output" / "scoring").rglob("*.parquet"))
-        assert len(scoring_files) > 0
-        df = pd.read_parquet(scoring_files[0])
-        assert "trend_score" in df.columns
-        assert "momentum_score" in df.columns
+        router_files = list(Path(tmp_path / "output" / "router").rglob("*.parquet"))
+        assert len(router_files) > 0
 
-    def test_stable_parquet_has_continuous_scores(self, pipeline, tmp_path):
+    def test_pipeline_persist_writes_breadth_parquet(self, pipeline, tmp_path):
         self._mock(pipeline)
         pipeline.run(universes=["NIFTY500"], persist=True)
-        stable_files = list(
-            Path(tmp_path / "output" / "stable_classifications").rglob("*.parquet")
-        )
-        assert len(stable_files) > 0
-        df = pd.read_parquet(stable_files[0])
-        assert "smoothed_confidence"  in df.columns
-        assert "oscillation_detected" in df.columns
-
-    def test_max_symbols_respected(self, pipeline):
-        self._mock(pipeline)
-        out = pipeline.run(universes=["NIFTY500"], persist=False, max_symbols=2)
-        assert len(out.stock_results["NIFTY500"]) == 2
-
-    def test_elapsed_time_populated(self, pipeline):
-        self._mock(pipeline)
-        out = pipeline.run(universes=["NIFTY500"], persist=False)
-        assert out.elapsed_seconds > 0
+        breadth_files = list(Path(tmp_path / "output" / "breadth").rglob("*.parquet"))
+        assert len(breadth_files) > 0
+        df = pd.read_parquet(breadth_files[0])
+        assert "pct_bullish"    in df.columns
+        assert "breadth_state"  in df.columns

@@ -1,16 +1,19 @@
 """
-stock_regime/src/models.py
-==========================
-Typed data contracts for every layer of the Stock Regime Engine pipeline.
+stock_regime/src/models.py — Extended with Phase 1+2 indicator fields.
 
-Changes from previous version
-------------------------------
-- StockIndicatorSnapshot: added roc_10, roc_21, acceleration, rs_1m/3m/6m,
-  rs_trend, higher_highs_count, ema_distance_pct
-- StockSignals: added roc_positive, roc_accelerating, rs_improving,
-  rs_weakening, higher_highs, ema_extended
-- ContinuousScores dataclass (NEW) — replaces binary dimensional scoring
-- DimensionalScores: now wraps ContinuousScores; backward-compatible
+Phase 1 additions to StockIndicatorSnapshot:
+  candle_instability, reversal_frequency, gap_frequency, wickiness_score
+
+Phase 2 additions to StockIndicatorSnapshot:
+  bb_width, directional_efficiency, ema_spread
+
+Phase 1 additions to StockSignals:
+  volatile_instability  — composite erratic-market signal
+  candle_erratic        — high candle instability
+  high_reversal_freq    — direction reversals too frequent
+  range_bound           — directional efficiency low (Phase 2)
+  bb_compressed         — Bollinger bands tight (Phase 2)
+  ema_compressed        — EMA20/50 converged (Phase 2)
 """
 
 from __future__ import annotations
@@ -44,38 +47,24 @@ class MarketRegimeInput:
             confidence=float(d.get("confidence", 0.0)),
         )
 
-    def __repr__(self) -> str:
+    def __repr__(self):
         return f"MarketRegimeInput(regime={self.regime!r}, confidence={self.confidence:.2f})"
 
 
 @dataclass
 class StockIndicatorSnapshot:
-    """
-    All computed indicator values for one bar.
-
-    New fields added for continuous scoring and trend/momentum separation:
-    roc_10, roc_21, acceleration  — rate-of-change and momentum acceleration
-    rs_1m, rs_3m, rs_6m           — multi-period relative strength
-    rs_trend                       — slope of rs_3m (improving vs weakening)
-    higher_highs_count             — trend quality (count of higher highs)
-    ema_distance_pct               — (close - ema200) / ema200
-    """
-    # Core
+    # Core price
     close: float = float("nan")
 
     # EMAs
     ema20:  Optional[float] = None
     ema50:  Optional[float] = None
     ema200: Optional[float] = None
-
-    # EMA slopes
     ema20_slope: Optional[float] = None
     ema50_slope: Optional[float] = None
 
-    # Trend strength
-    adx: Optional[float] = None
-
-    # Volatility
+    # Strength / volatility
+    adx:    Optional[float] = None
     atr:    Optional[float] = None
     atr_ma: Optional[float] = None
 
@@ -83,26 +72,35 @@ class StockIndicatorSnapshot:
     volume:    Optional[float] = None
     volume_ma: Optional[float] = None
 
-    # Legacy RS (kept for compatibility)
+    # RS (legacy alias kept)
     relative_strength: Optional[float] = None
+    high_52w:          Optional[float] = None
 
-    # Rolling high
-    high_52w: Optional[float] = None
-
-    # NEW: Rate of change (momentum separation)
+    # ROC / momentum
     roc_10:       Optional[float] = None
     roc_21:       Optional[float] = None
-    acceleration: Optional[float] = None   # roc_10 - roc_21
+    acceleration: Optional[float] = None
 
-    # NEW: Multi-period RS
-    rs_1m:   Optional[float] = None   # 21-bar
-    rs_3m:   Optional[float] = None   # 63-bar (replaces relative_strength going forward)
-    rs_6m:   Optional[float] = None   # 126-bar
-    rs_trend: Optional[float] = None  # slope of rs_3m over last N bars
+    # Multi-period RS
+    rs_1m:    Optional[float] = None
+    rs_3m:    Optional[float] = None
+    rs_6m:    Optional[float] = None
+    rs_trend: Optional[float] = None
 
-    # NEW: Trend quality
+    # Trend quality
     higher_highs_count: Optional[int]   = None
-    ema_distance_pct:   Optional[float] = None   # (close - ema200) / ema200
+    ema_distance_pct:   Optional[float] = None
+
+    # Phase 1 — volatility instability
+    candle_instability: Optional[float] = None   # erratic move ratio
+    reversal_frequency: Optional[float] = None   # direction-flip fraction
+    gap_frequency:      Optional[float] = None   # open-gap fraction
+    wickiness_score:    Optional[float] = None   # wick-to-range ratio
+
+    # Phase 2 — range detection
+    bb_width:               Optional[float] = None   # Bollinger bandwidth
+    directional_efficiency: Optional[float] = None   # DER [0=ranging, 1=trending]
+    ema_spread:             Optional[float] = None   # (ema20-ema50)/close
 
     def is_complete(self) -> bool:
         core = [
@@ -118,34 +116,32 @@ class StockIndicatorSnapshot:
 
     def to_dict(self) -> dict:
         return {
-            "close":              self.close,
-            "ema20":              self.ema20,
-            "ema50":              self.ema50,
-            "ema200":             self.ema200,
-            "ema20_slope":        self.ema20_slope,
-            "ema50_slope":        self.ema50_slope,
-            "adx":                self.adx,
-            "atr":                self.atr,
-            "atr_ma":             self.atr_ma,
-            "volume":             self.volume,
-            "volume_ma":          self.volume_ma,
-            "relative_strength":  self.relative_strength,
-            "high_52w":           self.high_52w,
-            "roc_10":             self.roc_10,
-            "roc_21":             self.roc_21,
-            "acceleration":       self.acceleration,
-            "rs_1m":              self.rs_1m,
-            "rs_3m":              self.rs_3m,
-            "rs_6m":              self.rs_6m,
-            "rs_trend":           self.rs_trend,
+            "close": self.close, "ema20": self.ema20, "ema50": self.ema50,
+            "ema200": self.ema200, "ema20_slope": self.ema20_slope,
+            "ema50_slope": self.ema50_slope, "adx": self.adx,
+            "atr": self.atr, "atr_ma": self.atr_ma,
+            "volume": self.volume, "volume_ma": self.volume_ma,
+            "relative_strength": self.relative_strength, "high_52w": self.high_52w,
+            "roc_10": self.roc_10, "roc_21": self.roc_21,
+            "acceleration": self.acceleration,
+            "rs_1m": self.rs_1m, "rs_3m": self.rs_3m, "rs_6m": self.rs_6m,
+            "rs_trend": self.rs_trend,
             "higher_highs_count": self.higher_highs_count,
-            "ema_distance_pct":   self.ema_distance_pct,
+            "ema_distance_pct": self.ema_distance_pct,
+            # Phase 1
+            "candle_instability": self.candle_instability,
+            "reversal_frequency": self.reversal_frequency,
+            "gap_frequency":      self.gap_frequency,
+            "wickiness_score":    self.wickiness_score,
+            # Phase 2
+            "bb_width":               self.bb_width,
+            "directional_efficiency": self.directional_efficiency,
+            "ema_spread":             self.ema_spread,
         }
 
 
 @dataclass
 class StockSignals:
-    """Boolean signals. Extended with momentum and trend-quality signals."""
     # Trend direction
     price_above_ema200: bool = False
     price_below_ema200: bool = False
@@ -169,7 +165,7 @@ class StockSignals:
     # Volume
     volume_confirmed: bool = False
 
-    # RS (legacy)
+    # RS
     rs_positive: bool = False
     rs_negative: bool = False
     rs_strong:   bool = False
@@ -177,17 +173,23 @@ class StockSignals:
     # Breakout
     price_near_52w_high: bool = False
 
-    # NEW: Momentum signals
+    # Momentum
     roc_positive:     bool = False
     roc_accelerating: bool = False
+    rs_improving:     bool = False
+    rs_weakening:     bool = False
+    higher_highs:     bool = False
+    ema_extended:     bool = False
 
-    # NEW: RS improvement
-    rs_improving: bool = False
-    rs_weakening: bool = False
+    # Phase 1 — volatility instability (NEW)
+    candle_erratic:       bool = False   # candle_instability > threshold
+    high_reversal_freq:   bool = False   # reversal_frequency > threshold
+    volatile_instability: bool = False   # composite: erratic + reversals + gaps
 
-    # NEW: Trend quality
-    higher_highs: bool = False
-    ema_extended: bool = False
+    # Phase 2 — range detection (NEW)
+    range_bound:    bool = False   # directional_efficiency < threshold
+    bb_compressed:  bool = False   # bb_width < bb_narrow_threshold
+    ema_compressed: bool = False   # |ema_spread| < ema_compressed_threshold
 
     def to_dict(self) -> dict:
         return {
@@ -214,37 +216,31 @@ class StockSignals:
             "rs_weakening":        self.rs_weakening,
             "higher_highs":        self.higher_highs,
             "ema_extended":        self.ema_extended,
+            # Phase 1
+            "candle_erratic":       self.candle_erratic,
+            "high_reversal_freq":   self.high_reversal_freq,
+            "volatile_instability": self.volatile_instability,
+            # Phase 2
+            "range_bound":    self.range_bound,
+            "bb_compressed":  self.bb_compressed,
+            "ema_compressed": self.ema_compressed,
         }
 
 
 @dataclass
 class ContinuousScores:
-    """
-    Continuous normalized component scores in [0, 1] computed directly
-    from raw indicator values — NOT from boolean signals.
-
-    These drive the dimensional scores so rankings have realistic gradient
-    rather than binary saturation (trend=1.0 / momentum=1.0 too often).
-
-    Calibration reference
-    ---------------------
-    adx_score:           0 at ADX=0,  0.5 at ADX=25, 1.0 at ADX=50
-    ema_alignment_score: 0.33 per bullish EMA pair (3 pairs total)
-    ema_distance_score:  0 at distance=0, 1.0 at distance=+20%  (capped)
-    atr_expansion_score: 0 at ratio=0.5,  0.5 at ratio=1.0, 1.0 at ratio=2.0
-    rs_score:            0 at RS=0.90,     0.5 at RS=1.0,   1.0 at RS=1.10
-    rs_trend_score:      0=falling,  0.5=flat,  1.0=strongly rising
-    roc_score:           0 at roc_10=-5%,  0.5 at 0%,       1.0 at +5%
-    volume_score:        0 at vol/vol_ma=0.5, 0.5 at 1.0,   1.0 at 2.0
-    """
     adx_score:           float = 0.0
     ema_alignment_score: float = 0.0
-    ema_distance_score:  float = 0.0
-    atr_expansion_score: float = 0.5   # neutral default
-    rs_score:            float = 0.5   # neutral default
-    rs_trend_score:      float = 0.5   # neutral default
-    roc_score:           float = 0.5   # neutral default
+    ema_distance_score:  float = 0.5
+    atr_expansion_score: float = 0.5
+    rs_score:            float = 0.5
+    rs_trend_score:      float = 0.5
+    roc_score:           float = 0.5
     volume_score:        float = 0.0
+    # Phase 1
+    instability_score:   float = 0.0   # higher = more erratic/unstable
+    # Phase 2
+    ranging_score:       float = 0.0   # higher = more range-bound
 
     def to_dict(self) -> dict:
         return {
@@ -256,15 +252,13 @@ class ContinuousScores:
             "rs_trend_score":      round(self.rs_trend_score,       4),
             "roc_score":           round(self.roc_score,            4),
             "volume_score":        round(self.volume_score,         4),
+            "instability_score":   round(self.instability_score,    4),
+            "ranging_score":       round(self.ranging_score,        4),
         }
 
 
 @dataclass
 class DimensionalScores:
-    """
-    Three orthogonal scores [0, 1] for ranking. Now derived from
-    ContinuousScores — no longer binary-saturated.
-    """
     trend:      float = 0.0
     momentum:   float = 0.0
     volatility: float = 0.0
@@ -299,13 +293,10 @@ class StockRegimeResult:
     def to_dict(self) -> dict:
         snap = self.indicators
 
-        def _clean(v):
-            if v is None:
-                return None
-            try:
-                return None if math.isnan(v) or math.isinf(v) else round(v, 4)
-            except (TypeError, ValueError):
-                return None
+        def _c(v):
+            if v is None: return None
+            try: return None if math.isnan(v) or math.isinf(v) else round(v, 4)
+            except: return None
 
         return {
             "symbol":        self.symbol,
@@ -316,17 +307,14 @@ class StockRegimeResult:
             "regime_scores": {k: round(v, 4) for k, v in self.regime_scores.items()},
             "signals":       self.signals.to_dict(),
             "indicators": {
-                "close":             _clean(snap.close),
-                "ema20":             _clean(snap.ema20),
-                "ema50":             _clean(snap.ema50),
-                "ema200":            _clean(snap.ema200),
-                "adx":               _clean(snap.adx),
-                "atr":               _clean(snap.atr),
-                "relative_strength": _clean(snap.relative_strength),
-                "roc_10":            _clean(snap.roc_10),
-                "roc_21":            _clean(snap.roc_21),
-                "acceleration":      _clean(snap.acceleration),
-                "rs_3m":             _clean(snap.rs_3m),
-                "rs_trend":          _clean(snap.rs_trend),
+                "close": _c(snap.close), "ema20": _c(snap.ema20),
+                "ema50": _c(snap.ema50), "ema200": _c(snap.ema200),
+                "adx": _c(snap.adx), "atr": _c(snap.atr),
+                "relative_strength": _c(snap.relative_strength),
+                "roc_10": _c(snap.roc_10), "rs_3m": _c(snap.rs_3m),
+                "candle_instability": _c(snap.candle_instability),
+                "reversal_frequency": _c(snap.reversal_frequency),
+                "bb_width": _c(snap.bb_width),
+                "directional_efficiency": _c(snap.directional_efficiency),
             },
         }
