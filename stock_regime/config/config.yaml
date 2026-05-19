@@ -188,19 +188,17 @@ score_diagnostics:
   persist_distributions: true
   log_top_percentile: 90
 breadth_engine:
-  extreme_threshold: 75.0
-  expanding_threshold: 55.0
-  contracting_threshold: 45.0
+  extreme_threshold: 72.0
+  expanding_threshold: 45.0
+  contracting_threshold: 38.0
+  emerging_weight: 0.4
 sector_engine:
   leading_threshold: 60.0
   lagging_threshold: 40.0
 strategy_router:
-  min_quality_for_trade: 0.45
-  min_confidence_for_trade: 0.52
+  min_quality_for_trade: 0.4
+  min_confidence_for_trade: 0.5
   min_quality_for_full_size: 0.65
   adverse_breadth_states:
   - EXTREME_DOWN
   - CONTRACTING
-  adverse_market_regimes:
-  - VOLATILE
-  - UNCERTAIN
