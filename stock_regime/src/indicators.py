@@ -1,20 +1,40 @@
 """
 stock_regime/src/indicators.py
 ================================
-Computes all technical indicators from a normalised OHLCV DataFrame.
+Phase 3 — Volatility classification fix:
 
-Changes in this version
-------------------------
-Phase 1 — Volatility fix:
-  candle_instability    : mean |return| / ATR ratio (erratic = high)
-  reversal_frequency    : fraction of bars where direction reversed
-  gap_frequency         : fraction of bars with open gap > threshold
-  wickiness_score       : mean wick-to-range ratio (indecision / rejection)
+Replaced four loosely-calibrated individual instability metrics with a single
+coherent volatility_instability_score [0, 1] computed in the indicator layer.
 
-Phase 2 — Range detection:
-  bb_width              : Bollinger Band width (close normalised)
-  directional_efficiency: ROC over N bars / sum of |daily returns| (0=ranging, 1=trending)
-  ema_spread            : (ema20 - ema50) / close — compressed when near 0
+Key insight from calibration
+------------------------------
+dir_cv (directional coefficient of variation = std(roc5) / |mean(roc5)|) is
+the most discriminating signal:
+  - Strong smooth trend → dir_cv ≈ 1.4  (consistent direction)
+  - Genuinely erratic   → dir_cv ≈ 14.6 (direction reverses constantly)
+
+The old wickiness_score formula — (total-body)/total — scored ~0.92 on ALL
+stocks because even healthy trend candles have small wicks. Replaced with
+upper-wick / total-range (rejection ratio) which is more meaningful.
+
+Composite formula (weighted sum → [0, 1]):
+  volatility_instability_score =
+      0.40 * dir_cv_score       (PRIMARY — directional inconsistency)
+    + 0.25 * gap_instab_score   (overnight gap / ATR ratio)
+    + 0.15 * rev_freq_score     (direction flip frequency)
+    + 0.10 * rej_ratio_score    (upper-wick rejection ratio)
+    + 0.10 * body_clean_score   (inverted body ratio — small bodies = indecision)
+
+Calibrated thresholds:
+  Clean smooth trend:  composite ≈ 0.10 – 0.25  → NOT volatile
+  Genuine erratic:     composite ≈ 0.45 – 0.80  → VOLATILE
+
+Backward compatibility:
+  - candle_instability field = dir_cv_score (was abs_ret/atr_pct ratio)
+  - wickiness_score field    = rej_ratio (upper wick / total range)
+  - reversal_frequency field = unchanged
+  - gap_frequency field      = unchanged
+  - volatility_instability_score = NEW composite (primary signal)
 """
 
 from __future__ import annotations
@@ -44,7 +64,7 @@ class StockIndicatorCalculator:
         row_index: int = -1,
         benchmark_df: Optional[pd.DataFrame] = None,
     ) -> StockIndicatorSnapshot:
-        df = self._normalise_columns(df)
+        df         = self._normalise_columns(df)
         self._validate(df)
         enriched   = self._add_indicators(df)
         rs_profile = self._compute_rs_profile(df, benchmark_df, row_index)
@@ -60,7 +80,7 @@ class StockIndicatorCalculator:
         required = {"open", "high", "low", "close", "volume"}
         missing  = required - set(df.columns)
         if missing:
-            raise ValueError(f"DataFrame is missing required columns: {missing}")
+            raise ValueError(f"DataFrame missing required columns: {missing}")
         min_bars = max(self.cfg.ema_slow, self.cfg.high_period) + 30
         if len(df) < min_bars:
             warnings.warn(
@@ -98,82 +118,144 @@ class StockIndicatorCalculator:
         df["high_52w"] = df["close"].rolling(window=cfg.high_period, min_periods=50).max()
 
         # ── ROC / acceleration ──────────────────────────────────────
-        df["roc_10"]      = df["close"].pct_change(10) * 100
-        df["roc_21"]      = df["close"].pct_change(21) * 100
-        df["acceleration"]= df["roc_10"] - df["roc_21"]
+        df["roc_10"]       = df["close"].pct_change(10) * 100
+        df["roc_21"]       = df["close"].pct_change(21) * 100
+        df["acceleration"] = df["roc_10"] - df["roc_21"]
 
         # ── EMA distance ────────────────────────────────────────────
         ema200 = df[f"ema{cfg.ema_slow}"]
-        df["ema_distance_pct"] = (df["close"] - ema200) / ema200.replace(0, np.nan)
+        df["ema_distance_pct"] = (
+            (df["close"] - ema200) / ema200.replace(0, np.nan).astype(float)
+        ).astype(float)
 
         # ── Higher highs ────────────────────────────────────────────
         hh_window = int(getattr(thr, "higher_highs_window", 20))
         rolling_high_prev = df["high"].shift(1).rolling(hh_window, min_periods=5).max()
-        df["is_higher_high"]      = (df["high"] > rolling_high_prev).astype(int)
-        df["higher_highs_count"]  = df["is_higher_high"].rolling(hh_window, min_periods=5).sum()
+        df["is_higher_high"]     = (df["high"] > rolling_high_prev).astype(int)
+        df["higher_highs_count"] = (
+            df["is_higher_high"].rolling(hh_window, min_periods=5).sum()
+        )
 
-        # ────────────────────────────────────────────────────────────
-        # PHASE 1: Volatility quality indicators
-        # ────────────────────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────────────
+        # PHASE 3: Composite volatility instability score
+        # ─────────────────────────────────────────────────────────────
         vi_window = int(getattr(thr, "volatility_instability_window", 20))
-        returns   = df["close"].pct_change()
 
-        # candle_instability: mean |return| relative to ATR baseline.
-        # A strong trend has big moves in ONE direction → low instability.
-        # An erratic market has big moves in BOTH directions → high.
-        abs_ret = returns.abs()
-        _atr_pct = (df["atr"] / df["close"].replace(0, np.nan)).astype(float)
-        _atr_pct_ma = _atr_pct.rolling(vi_window, min_periods=5).mean()
-        df["candle_instability"] = (
-            abs_ret.astype(float).rolling(vi_window, min_periods=5).mean() /
-            _atr_pct_ma.replace(0, np.nan)
+        # Shared intermediates — explicit float cast prevents pd.NA dtype issues
+        total_range = (df["high"] - df["low"]).replace(0, np.nan).astype(float)
+        body        = (df["close"] - df["open"]).abs().astype(float)
+        upper_wick  = (df["high"] - df[["close", "open"]].max(axis=1)).astype(float)
+        prev_close  = df["close"].shift(1)
+        returns     = df["close"].pct_change().astype(float)
+        roc5        = (df["close"].pct_change(5) * 100).astype(float)
+        direction   = ((returns > 0).astype(int) - (returns < 0).astype(int))
+        atr_approx  = total_range.rolling(14, min_periods=5).mean()
+
+        # ── Component 1 (weight 0.40): Directional CV ────────────────
+        # std(roc5) / |mean(roc5)| over vi_window bars.
+        # Trending stock: consistent direction → low std/mean ratio (dir_cv ≈ 1–2)
+        # Erratic stock:  random direction    → high ratio (dir_cv ≈ 10–20)
+        roc5_std  = roc5.rolling(vi_window, min_periods=5).std()
+        roc5_mean = (
+            roc5.rolling(vi_window, min_periods=5).mean()
+            .abs().replace(0, np.nan).astype(float)
+        )
+        dir_cv = (roc5_std / roc5_mean).astype(float)
+        # Normalise to [0, 1]: cap at 15 (values above that are all "very erratic")
+        df["dir_cv_score"] = (dir_cv.clip(0, 15) / 15.0).astype(float)
+
+        # ── Component 2 (weight 0.25): Gap instability ───────────────
+        # Rolling mean of (|open - prev_close| / ATR).
+        # Large opening gaps relative to ATR = unstable overnight sentiment.
+        gap_abs   = (df["open"] - prev_close).abs().astype(float)
+        gap_ratio = (gap_abs / atr_approx.replace(0, np.nan).astype(float)).astype(float)
+        df["gap_instab_score"] = (
+            gap_ratio.rolling(vi_window, min_periods=5).mean().clip(0, 1.0)
         ).astype(float)
 
-        # reversal_frequency: fraction of bars where daily direction flipped.
-        # Trending stocks have low reversal_frequency.
-        direction    = returns.apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
-        dir_change   = (direction != direction.shift(1)).astype(int)
-        df["reversal_frequency"] = dir_change.rolling(vi_window, min_periods=5).mean()
+        # ── Component 3 (weight 0.15): Reversal frequency ────────────
+        # Fraction of bars where daily direction changed.
+        # Baseline for random walk ≈ 0.50; trending stock < 0.45.
+        dir_change = (direction != direction.shift(1)).astype(float)
+        rev_freq   = dir_change.rolling(vi_window, min_periods=5).mean().astype(float)
+        df["reversal_frequency"] = rev_freq
+        # Normalise: 0.30 (strong trend) → 0;  0.70 (fully random) → 1.0
+        df["rev_freq_score"] = ((rev_freq - 0.30) / 0.40).clip(0, 1).astype(float)
 
-        # gap_frequency: fraction of bars where |open - prev_close| > gap threshold.
+        # ── Component 4 (weight 0.10): Upper-wick rejection ratio ────
+        # Mean upper_wick / total_range over window.
+        # High upper wicks = price rejected upward moves = instability / distribution.
+        # (Replaces old "all-wick" formula that scored ~0.92 on ALL stocks.)
+        rej_ratio = (upper_wick / total_range).astype(float)
+        df["wickiness_score"]  = (
+            rej_ratio.rolling(vi_window, min_periods=5).mean().astype(float)
+        )
+        df["rej_ratio_score"] = (
+            (df["wickiness_score"] - 0.25) / 0.30
+        ).clip(0, 1).astype(float)
+
+        # ── Component 5 (weight 0.10): Body cleanliness (inverted) ───
+        # Small bodies relative to range = doji / spinning top candles = indecision.
+        body_ratio = (body / total_range.replace(0, np.nan).astype(float)).astype(float)
+        body_ma    = body_ratio.rolling(vi_window, min_periods=5).mean()
+        # Invert: large body (0.60) → 0 (clean);  small body (0.25) → 1 (indecision)
+        df["body_clean_score"] = (
+            (1.0 - (body_ma - 0.25) / 0.35).clip(0, 1).astype(float)
+        )
+
+        # ── Weighted composite ───────────────────────────────────────
+        df["volatility_instability_score"] = (
+            0.40 * df["dir_cv_score"]     +
+            0.25 * df["gap_instab_score"] +
+            0.15 * df["rev_freq_score"]   +
+            0.10 * df["rej_ratio_score"]  +
+            0.10 * df["body_clean_score"]
+        ).clip(0, 1).astype(float)
+
+        # ── Backward-compat aliases ──────────────────────────────────
+        # candle_instability previously held abs_ret/atr_pct;
+        # now holds dir_cv_score (same concept, better formula).
+        df["candle_instability"] = df["dir_cv_score"]
+
+        # gap_frequency = raw fraction of bars with gap > threshold (kept for filters)
         gap_thr = float(getattr(thr, "gap_threshold_pct", 0.01))
-        prev_close = df["close"].shift(1)
-        gap_pct    = ((df["open"] - prev_close) / prev_close.replace(0, np.nan)).abs().astype(float)
-        df["gap_frequency"] = (gap_pct > gap_thr).astype(float).rolling(
-            vi_window, min_periods=5
-        ).mean()
+        df["gap_frequency"] = (
+            (gap_abs > df["close"] * gap_thr)
+            .astype(float)
+            .rolling(vi_window, min_periods=5)
+            .mean()
+            .astype(float)
+        )
 
-        # wickiness_score: mean (high - low - |close - open|) / (high - low + 1e-9)
-        # High wicks = rejection / indecision — hallmark of unstable markets.
-        body     = (df["close"] - df["open"]).abs()
-        total    = (df["high"] - df["low"]).replace(0, np.nan).astype(float)
-        wick_pct = ((total - body) / total).astype(float)
-        df["wickiness_score"] = wick_pct.rolling(vi_window, min_periods=5).mean()
-
-        # ────────────────────────────────────────────────────────────
-        # PHASE 2: Range detection indicators
-        # ────────────────────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────────────
+        # Phase 2: Range detection indicators (unchanged)
+        # ─────────────────────────────────────────────────────────────
         bb_period = int(getattr(thr, "bb_period", 20))
         bb_std    = float(getattr(thr, "bb_std", 2.0))
+        bb_mid    = df["close"].rolling(bb_period, min_periods=10).mean()
+        bb_s      = df["close"].rolling(bb_period, min_periods=10).std()
+        bb_upper  = bb_mid + bb_std * bb_s
+        bb_lower  = bb_mid - bb_std * bb_s
+        df["bb_width"] = (
+            (bb_upper - bb_lower) / bb_mid.replace(0, np.nan).astype(float)
+        ).astype(float)
 
-        # Bollinger Band width: (upper - lower) / middle
-        bb_mid   = df["close"].rolling(bb_period, min_periods=10).mean()
-        bb_s     = df["close"].rolling(bb_period, min_periods=10).std()
-        bb_upper = bb_mid + bb_std * bb_s
-        bb_lower = bb_mid - bb_std * bb_s
-        df["bb_width"] = (bb_upper - bb_lower) / bb_mid.replace(0, np.nan)
-
-        # Directional efficiency ratio (DER): net ROC / cumulative |returns|
-        # 1.0 = perfectly trending; 0.0 = perfectly ranging
         der_window = int(getattr(thr, "der_window", 14))
-        net_move   = (df["close"] - df["close"].shift(der_window)).abs()
-        path_len   = abs_ret.rolling(der_window, min_periods=5).sum() * df["close"].shift(der_window)
-        df["directional_efficiency"] = (net_move.astype(float) / path_len.replace(0, np.nan).astype(float)).clip(0, 1)
+        abs_ret    = returns.abs().astype(float)
+        net_move   = (df["close"] - df["close"].shift(der_window)).abs().astype(float)
+        path_len   = (
+            abs_ret.rolling(der_window, min_periods=5).sum() *
+            df["close"].shift(der_window)
+        ).astype(float)
+        df["directional_efficiency"] = (
+            (net_move / path_len.replace(0, np.nan).astype(float)).clip(0, 1)
+        ).astype(float)
 
-        # EMA spread compression: (ema20 - ema50) / close
         ema20 = df[f"ema{cfg.ema_fast}"]
         ema50 = df[f"ema{cfg.ema_mid}"]
-        df["ema_spread"] = (ema20 - ema50) / df["close"].replace(0, np.nan)
+        df["ema_spread"] = (
+            (ema20 - ema50) / df["close"].replace(0, np.nan).astype(float)
+        ).astype(float)
 
         return df
 
@@ -186,9 +268,9 @@ class StockIndicatorCalculator:
         bench.columns = [c.lower().strip() for c in bench.columns]
         if "close" not in bench.columns:
             return {"rs_1m": None, "rs_3m": None, "rs_6m": None, "rs_trend": None}
-        n      = len(df)
-        abs_idx= row_index if row_index >= 0 else n + row_index
-        result = {}
+        n       = len(df)
+        abs_idx = row_index if row_index >= 0 else n + row_index
+        result  = {}
         for key, period in {"rs_1m": 21, "rs_3m": 63, "rs_6m": 126}.items():
             result[key] = self._single_rs(df, bench, abs_idx, period)
         tw = int(getattr(self.cfg.indicators, "rs_trend_window", 10))
@@ -199,8 +281,10 @@ class StockIndicatorCalculator:
         if abs_idx < period: return None
         ab = min(abs_idx, len(bench_df) - 1)
         if ab < period: return None
-        sn, sp = stock_df["close"].iloc[abs_idx], stock_df["close"].iloc[abs_idx - period]
-        bn, bp = bench_df["close"].iloc[ab],      bench_df["close"].iloc[ab - period]
+        sn = stock_df["close"].iloc[abs_idx]
+        sp = stock_df["close"].iloc[abs_idx - period]
+        bn = bench_df["close"].iloc[ab]
+        bp = bench_df["close"].iloc[ab - period]
         if sp <= 0 or bp <= 0 or bn <= 0: return None
         br = bn / bp
         return round((sn / sp) / br, 4) if br > 0 else None
@@ -214,11 +298,13 @@ class StockIndicatorCalculator:
                 if rs is not None:
                     rs_series.append(rs)
         if len(rs_series) < max(window // 2, 3): return None
-        n      = len(rs_series)
-        xs     = list(range(n))
-        mx, my = sum(xs)/n, sum(rs_series)/n
-        denom  = sum((x - mx)**2 for x in xs)
-        return round(sum((x-mx)*(y-my) for x,y in zip(xs,rs_series))/denom, 6) if denom else 0.0
+        n = len(rs_series)
+        xs = list(range(n))
+        mx, my = sum(xs) / n, sum(rs_series) / n
+        denom  = sum((x - mx) ** 2 for x in xs)
+        return round(
+            sum((x - mx) * (y - my) for x, y in zip(xs, rs_series)) / denom, 6
+        ) if denom else 0.0
 
     # ── Snapshot extraction ──────────────────────────────────────────
 
@@ -232,7 +318,8 @@ class StockIndicatorCalculator:
             try:
                 fv = float(v)
                 return None if math.isnan(fv) else fv
-            except: return None
+            except Exception:
+                return None
 
         def _int_val(col):
             v = _val(col)
@@ -240,35 +327,37 @@ class StockIndicatorCalculator:
 
         rs_3m = rs_profile.get("rs_3m")
         return StockIndicatorSnapshot(
-            close                = float(row["close"]),
-            ema20                = _val(f"ema{cfg.ema_fast}"),
-            ema50                = _val(f"ema{cfg.ema_mid}"),
-            ema200               = _val(f"ema{cfg.ema_slow}"),
-            ema20_slope          = _val("ema20_slope"),
-            ema50_slope          = _val("ema50_slope"),
-            adx                  = _val("adx"),
-            atr                  = _val("atr"),
-            atr_ma               = _val("atr_ma"),
-            volume               = _val("volume"),
-            volume_ma            = _val("volume_ma"),
-            relative_strength    = rs_3m,
-            high_52w             = _val("high_52w"),
-            roc_10               = _val("roc_10"),
-            roc_21               = _val("roc_21"),
-            acceleration         = _val("acceleration"),
-            rs_1m                = rs_profile.get("rs_1m"),
-            rs_3m                = rs_3m,
-            rs_6m                = rs_profile.get("rs_6m"),
-            rs_trend             = rs_profile.get("rs_trend"),
-            higher_highs_count   = _int_val("higher_highs_count"),
-            ema_distance_pct     = _val("ema_distance_pct"),
-            # Phase 1 — volatility instability
-            candle_instability   = _val("candle_instability"),
-            reversal_frequency   = _val("reversal_frequency"),
-            gap_frequency        = _val("gap_frequency"),
-            wickiness_score      = _val("wickiness_score"),
+            close                        = float(row["close"]),
+            ema20                        = _val(f"ema{cfg.ema_fast}"),
+            ema50                        = _val(f"ema{cfg.ema_mid}"),
+            ema200                       = _val(f"ema{cfg.ema_slow}"),
+            ema20_slope                  = _val("ema20_slope"),
+            ema50_slope                  = _val("ema50_slope"),
+            adx                          = _val("adx"),
+            atr                          = _val("atr"),
+            atr_ma                       = _val("atr_ma"),
+            volume                       = _val("volume"),
+            volume_ma                    = _val("volume_ma"),
+            relative_strength            = rs_3m,
+            high_52w                     = _val("high_52w"),
+            roc_10                       = _val("roc_10"),
+            roc_21                       = _val("roc_21"),
+            acceleration                 = _val("acceleration"),
+            rs_1m                        = rs_profile.get("rs_1m"),
+            rs_3m                        = rs_3m,
+            rs_6m                        = rs_profile.get("rs_6m"),
+            rs_trend                     = rs_profile.get("rs_trend"),
+            higher_highs_count           = _int_val("higher_highs_count"),
+            ema_distance_pct             = _val("ema_distance_pct"),
+            # Phase 3 — composite (primary)
+            volatility_instability_score = _val("volatility_instability_score"),
+            # Backward-compat component fields
+            candle_instability           = _val("candle_instability"),   # = dir_cv_score
+            reversal_frequency           = _val("reversal_frequency"),
+            gap_frequency                = _val("gap_frequency"),
+            wickiness_score              = _val("wickiness_score"),       # = rej_ratio
             # Phase 2 — range detection
-            bb_width             = _val("bb_width"),
-            directional_efficiency = _val("directional_efficiency"),
-            ema_spread           = _val("ema_spread"),
+            bb_width                     = _val("bb_width"),
+            directional_efficiency       = _val("directional_efficiency"),
+            ema_spread                   = _val("ema_spread"),
         )

@@ -522,7 +522,7 @@ class AlgoTradingPipeline:
                             df[col].quantile(0.90))
 
     def _run_analytics(self, universe, output_root):
-        from stock_regime.analytics import RegimeAnalytics
+        from stock_regime.analytics.regime_analytics import RegimeAnalytics
         hp = Path(output_root) / "regime_history" / "regime_history.parquet"
         if not hp.exists(): return
         try:

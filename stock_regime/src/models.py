@@ -1,19 +1,11 @@
 """
-stock_regime/src/models.py — Extended with Phase 1+2 indicator fields.
-
-Phase 1 additions to StockIndicatorSnapshot:
-  candle_instability, reversal_frequency, gap_frequency, wickiness_score
-
-Phase 2 additions to StockIndicatorSnapshot:
-  bb_width, directional_efficiency, ema_spread
-
-Phase 1 additions to StockSignals:
-  volatile_instability  — composite erratic-market signal
-  candle_erratic        — high candle instability
-  high_reversal_freq    — direction reversals too frequent
-  range_bound           — directional efficiency low (Phase 2)
-  bb_compressed         — Bollinger bands tight (Phase 2)
-  ema_compressed        — EMA20/50 converged (Phase 2)
+stock_regime/src/models.py
+==========================
+Phase 3 addition to StockIndicatorSnapshot:
+  volatility_instability_score: Optional[float]
+    Composite instability score [0, 1] computed in indicators.py.
+    This is the PRIMARY signal for VOLATILE regime detection.
+    candle_instability / wickiness_score kept as backward-compat fields.
 """
 
 from __future__ import annotations
@@ -53,7 +45,17 @@ class MarketRegimeInput:
 
 @dataclass
 class StockIndicatorSnapshot:
-    # Core price
+    """
+    All computed indicator values for one bar.
+
+    Phase 3 addition
+    ----------------
+    volatility_instability_score : composite [0, 1] from indicators.py
+        < 0.25  → clean trend, not volatile
+        0.25–0.40 → borderline
+        > 0.40  → genuinely erratic/unstable → VOLATILE
+    """
+    # Core
     close: float = float("nan")
 
     # EMAs
@@ -63,7 +65,7 @@ class StockIndicatorSnapshot:
     ema20_slope: Optional[float] = None
     ema50_slope: Optional[float] = None
 
-    # Strength / volatility
+    # Strength
     adx:    Optional[float] = None
     atr:    Optional[float] = None
     atr_ma: Optional[float] = None
@@ -72,7 +74,7 @@ class StockIndicatorSnapshot:
     volume:    Optional[float] = None
     volume_ma: Optional[float] = None
 
-    # RS (legacy alias kept)
+    # RS (legacy alias)
     relative_strength: Optional[float] = None
     high_52w:          Optional[float] = None
 
@@ -91,16 +93,19 @@ class StockIndicatorSnapshot:
     higher_highs_count: Optional[int]   = None
     ema_distance_pct:   Optional[float] = None
 
-    # Phase 1 — volatility instability
-    candle_instability: Optional[float] = None   # erratic move ratio
-    reversal_frequency: Optional[float] = None   # direction-flip fraction
-    gap_frequency:      Optional[float] = None   # open-gap fraction
-    wickiness_score:    Optional[float] = None   # wick-to-range ratio
+    # Phase 3 — composite instability score (PRIMARY)
+    volatility_instability_score: Optional[float] = None
+
+    # Instability components (backward compat + diagnostics)
+    candle_instability: Optional[float] = None   # = dir_cv_score
+    reversal_frequency: Optional[float] = None
+    gap_frequency:      Optional[float] = None
+    wickiness_score:    Optional[float] = None   # = rej_ratio (upper wick / range)
 
     # Phase 2 — range detection
-    bb_width:               Optional[float] = None   # Bollinger bandwidth
-    directional_efficiency: Optional[float] = None   # DER [0=ranging, 1=trending]
-    ema_spread:             Optional[float] = None   # (ema20-ema50)/close
+    bb_width:               Optional[float] = None
+    directional_efficiency: Optional[float] = None
+    ema_spread:             Optional[float] = None
 
     def is_complete(self) -> bool:
         core = [
@@ -128,7 +133,8 @@ class StockIndicatorSnapshot:
             "rs_trend": self.rs_trend,
             "higher_highs_count": self.higher_highs_count,
             "ema_distance_pct": self.ema_distance_pct,
-            # Phase 1
+            # Phase 3
+            "volatility_instability_score": self.volatility_instability_score,
             "candle_instability": self.candle_instability,
             "reversal_frequency": self.reversal_frequency,
             "gap_frequency":      self.gap_frequency,
@@ -181,15 +187,15 @@ class StockSignals:
     higher_highs:     bool = False
     ema_extended:     bool = False
 
-    # Phase 1 — volatility instability (NEW)
-    candle_erratic:       bool = False   # candle_instability > threshold
+    # Phase 3 — volatility instability (composite-driven)
+    volatile_instability: bool = False   # PRIMARY: composite > threshold
+    candle_erratic:       bool = False   # dir_cv_score > threshold
     high_reversal_freq:   bool = False   # reversal_frequency > threshold
-    volatile_instability: bool = False   # composite: erratic + reversals + gaps
 
-    # Phase 2 — range detection (NEW)
-    range_bound:    bool = False   # directional_efficiency < threshold
-    bb_compressed:  bool = False   # bb_width < bb_narrow_threshold
-    ema_compressed: bool = False   # |ema_spread| < ema_compressed_threshold
+    # Phase 2 — range detection
+    range_bound:    bool = False
+    bb_compressed:  bool = False
+    ema_compressed: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -216,14 +222,12 @@ class StockSignals:
             "rs_weakening":        self.rs_weakening,
             "higher_highs":        self.higher_highs,
             "ema_extended":        self.ema_extended,
-            # Phase 1
-            "candle_erratic":       self.candle_erratic,
-            "high_reversal_freq":   self.high_reversal_freq,
-            "volatile_instability": self.volatile_instability,
-            # Phase 2
-            "range_bound":    self.range_bound,
-            "bb_compressed":  self.bb_compressed,
-            "ema_compressed": self.ema_compressed,
+            "volatile_instability":self.volatile_instability,
+            "candle_erratic":      self.candle_erratic,
+            "high_reversal_freq":  self.high_reversal_freq,
+            "range_bound":         self.range_bound,
+            "bb_compressed":       self.bb_compressed,
+            "ema_compressed":      self.ema_compressed,
         }
 
 
@@ -237,24 +241,11 @@ class ContinuousScores:
     rs_trend_score:      float = 0.5
     roc_score:           float = 0.5
     volume_score:        float = 0.0
-    # Phase 1
-    instability_score:   float = 0.0   # higher = more erratic/unstable
-    # Phase 2
-    ranging_score:       float = 0.0   # higher = more range-bound
+    instability_score:   float = 0.0   # = volatility_instability_score from indicators
+    ranging_score:       float = 0.0
 
     def to_dict(self) -> dict:
-        return {
-            "adx_score":           round(self.adx_score,           4),
-            "ema_alignment_score": round(self.ema_alignment_score,  4),
-            "ema_distance_score":  round(self.ema_distance_score,   4),
-            "atr_expansion_score": round(self.atr_expansion_score,  4),
-            "rs_score":            round(self.rs_score,             4),
-            "rs_trend_score":      round(self.rs_trend_score,       4),
-            "roc_score":           round(self.roc_score,            4),
-            "volume_score":        round(self.volume_score,         4),
-            "instability_score":   round(self.instability_score,    4),
-            "ranging_score":       round(self.ranging_score,        4),
-        }
+        return {k: round(v, 4) for k, v in self.__dict__.items()}
 
 
 @dataclass
@@ -296,7 +287,7 @@ class StockRegimeResult:
         def _c(v):
             if v is None: return None
             try: return None if math.isnan(v) or math.isinf(v) else round(v, 4)
-            except: return None
+            except Exception: return None
 
         return {
             "symbol":        self.symbol,
@@ -312,6 +303,7 @@ class StockRegimeResult:
                 "adx": _c(snap.adx), "atr": _c(snap.atr),
                 "relative_strength": _c(snap.relative_strength),
                 "roc_10": _c(snap.roc_10), "rs_3m": _c(snap.rs_3m),
+                "volatility_instability_score": _c(snap.volatility_instability_score),
                 "candle_instability": _c(snap.candle_instability),
                 "reversal_frequency": _c(snap.reversal_frequency),
                 "bb_width": _c(snap.bb_width),
