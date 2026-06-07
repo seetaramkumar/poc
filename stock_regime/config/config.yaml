@@ -256,9 +256,9 @@ sector_engine:
 
 # ── Strategy Router ───────────────────────────────────────────
 strategy_router:
-  min_quality_for_trade:     0.40
-  min_confidence_for_trade:  0.50
-  min_quality_for_full_size: 0.65
+  absolute_min_quality:      0.30
+  absolute_min_confidence:   0.30
+  min_quality_for_full_size: 0.70
   adverse_breadth_states:
     - EXTREME_DOWN
     - CONTRACTING
