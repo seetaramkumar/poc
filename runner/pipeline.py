@@ -50,6 +50,7 @@ class UniverseRunResult:
     stock_results:    list
     quality_scores:   list
     routing_decisions:list
+    ranked_opportunities: list        # list[RankedOpportunity]
     breadth_snapshot: object          # BreadthSnapshot | None
     sector_snapshots: list
     failed_symbols:   dict[str, str]
@@ -67,6 +68,7 @@ class PipelineRunOutput:
     stock_results:     dict[str, list]              = field(default_factory=dict)
     quality_scores:    dict[str, list]              = field(default_factory=dict)
     routing_decisions: dict[str, list]              = field(default_factory=dict)
+    ranked_opportunities: dict[str, list]           = field(default_factory=dict)
     breadth:           dict[str, object]            = field(default_factory=dict)
     sectors:           dict[str, list]              = field(default_factory=dict)
     universe_details:  dict[str, UniverseRunResult] = field(default_factory=dict)
@@ -164,13 +166,14 @@ class AlgoTradingPipeline:
                 universe_name, self._cfg["universes"][universe_name],
                 do_persist, eff_max, sym_cfg,
             )
-            output.market_results[universe_name]    = result.market_regime
-            output.stock_results[universe_name]     = result.stock_results
-            output.quality_scores[universe_name]    = result.quality_scores
-            output.routing_decisions[universe_name] = result.routing_decisions
-            output.breadth[universe_name]           = result.breadth_snapshot
-            output.sectors[universe_name]           = result.sector_snapshots
-            output.universe_details[universe_name]  = result
+            output.market_results[universe_name]       = result.market_regime
+            output.stock_results[universe_name]        = result.stock_results
+            output.quality_scores[universe_name]       = result.quality_scores
+            output.routing_decisions[universe_name]    = result.routing_decisions
+            output.ranked_opportunities[universe_name] = result.ranked_opportunities
+            output.breadth[universe_name]              = result.breadth_snapshot
+            output.sectors[universe_name]              = result.sector_snapshots
+            output.universe_details[universe_name]     = result
 
         output.elapsed_seconds = round(time.time() - t0, 2)
         logger.info("=" * 60)
@@ -201,6 +204,7 @@ class AlgoTradingPipeline:
         from stock_regime.sector_engine.sector  import SectorEngine
         from stock_regime.strategy_router.router import StrategyRouter
         from stock_regime.src.models     import MarketRegimeInput
+        from stock_regime.ranking.ranking_engine import RankingEngine
 
         benchmark_symbol = universe_cfg["benchmark"]
         symbol_source    = universe_cfg["symbol_source"]
@@ -324,26 +328,7 @@ class AlgoTradingPipeline:
         if persist:
             breadth_engine.persist(breadth_snap, output_root)
 
-        # ── 10. Sector engine (Phase 5) ───────────────────────────────
-        sector_engine   = SectorEngine.from_config(
-            self._stock_engine.config, universe_name, self._root
-        )
-        sector_snaps    = sector_engine.compute(stable_results, universe_name, self._run_date)
-        sector_states   = {
-            sym: sector_engine.get_sector(sym)
-            for sym in clean_data.keys()
-        }
-        # Map symbol → sector state (LEADING/NEUTRAL/LAGGING)
-        sector_state_map = {}
-        for snap in sector_snaps:
-            sector_state_map[snap.sector] = snap.sector_state
-        symbol_sector_state = {
-            sym: sector_state_map.get(sector_states.get(sym, "UNKNOWN"), "NEUTRAL")
-            for sym in clean_data.keys()
-        }
-        if persist:
-            sector_engine.persist(sector_snaps, output_root)
-
+        
         # ── 11. Quality scoring ───────────────────────────────────────
         quality_engine = OpportunityQualityEngine.from_config(self._stock_engine.config)
         quality_scores = quality_engine.evaluate_batch(
@@ -352,10 +337,26 @@ class AlgoTradingPipeline:
         if persist:
             quality_engine.persist(quality_scores, output_root, universe=universe_name)
 
-        # ── 12. Score diagnostics ─────────────────────────────────────
+
+        # ── 10. Sector engine (Phase 5) ───────────────────────────────
+        sector_engine   = SectorEngine.from_config(
+            self._stock_engine.config, universe_name, self._root
+        )
+        sector_snaps    = sector_engine.compute(stable_results, quality_scores, universe_name, self._run_date)
+        sector_states   = {
+            sym: sector_engine.get_sector(sym)
+            for sym in clean_data.keys()
+        }
+        # Map symbol → sector state (LEADING/NEUTRAL/LAGGING)
+        sector_state_map = {}
+        for snap in sector_snaps:
+            sector_state_map[snap.sector] = snap.state
+        symbol_sector_state = {
+            sym: sector_state_map.get(sector_states.get(sym, "UNKNOWN"), "NEUTRAL")
+            for sym in clean_data.keys()
+        }
         if persist:
-            self._persist_score_diagnostics(stable_results, universe_name)
-            self._persist_stable(stable_results, universe_name)
+            sector_engine.persist(sector_snaps, output_root)
 
         # ── 13. Strategy router (Phase 7) ────────────────────────────
         router   = StrategyRouter.from_config(self._stock_engine.config)
@@ -371,6 +372,35 @@ class AlgoTradingPipeline:
         if persist:
             router.persist(decisions, output_root, universe=universe_name)
 
+
+        # ── 11b. Opportunity ranking ─────────────────────────────
+        ranking_engine  = RankingEngine.from_config(self._stock_engine.config)
+        # Build symbol → sector display name for ranking output
+        symbol_sector_name = {
+            sym: sector_engine.get_sector(sym)
+            for sym in clean_data.keys()
+        }
+        ranked_opportunities = ranking_engine.rank(
+            stable_results     = stable_results,
+            quality_scores     = quality_scores,
+            routing_decisions  = decisions,
+            breadth_snapshot   = breadth_snap,
+            symbol_sector_map  = symbol_sector_state,   # 5-level state strings
+            symbol_sector_name = symbol_sector_name,    # display names
+            market_regime      = market_result["regime"],
+            universe           = universe_name,
+            run_date           = self._run_date,
+        )
+        if persist:
+            ranking_engine.persist(ranked_opportunities, output_root,
+                                   universe=universe_name)
+
+        # ── 12. Score diagnostics ─────────────────────────────────────
+        if persist:
+            self._persist_score_diagnostics(stable_results, universe_name)
+            self._persist_stable(stable_results, universe_name)
+
+
         # ── 14. Analytics ─────────────────────────────────────────────
         if persist:
             self._run_analytics(universe_name, output_root)
@@ -381,20 +411,21 @@ class AlgoTradingPipeline:
                            list(failed_symbols.keys())[:10])
 
         return UniverseRunResult(
-            universe          = universe_name,
-            market_regime     = market_result,
-            stock_results     = stable_results,
-            quality_scores    = quality_scores,
-            routing_decisions = decisions,
-            breadth_snapshot  = breadth_snap,
-            sector_snapshots  = sector_snaps,
-            failed_symbols    = failed_symbols,
-            symbols_loaded    = len(symbols),
-            accepted_count    = accepted_count,
-            excluded_count    = excluded_count,
-            rejected_count    = rejected_count,
-            benchmark_df      = benchmark_df,
-            run_date          = self._run_date,
+            universe             = universe_name,
+            market_regime        = market_result,
+            stock_results        = stable_results,
+            quality_scores       = quality_scores,
+            routing_decisions    = decisions,
+            ranked_opportunities = ranked_opportunities,
+            breadth_snapshot     = breadth_snap,
+            sector_snapshots     = sector_snaps,
+            failed_symbols       = failed_symbols,
+            symbols_loaded       = len(symbols),
+            accepted_count       = accepted_count,
+            excluded_count       = excluded_count,
+            rejected_count       = rejected_count,
+            benchmark_df         = benchmark_df,
+            run_date             = self._run_date,
         )
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -538,7 +569,7 @@ class AlgoTradingPipeline:
         return UniverseRunResult(
             universe=universe, market_regime=market_result,
             stock_results=[], quality_scores=[], routing_decisions=[],
-            breadth_snapshot=None, sector_snapshots=[],
+            ranked_opportunities=[], breadth_snapshot=None, sector_snapshots=[],
             failed_symbols=failed_symbols,
             symbols_loaded=symbols_loaded, accepted_count=accepted_count,
             excluded_count=excluded_count, rejected_count=rejected_count,

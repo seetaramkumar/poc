@@ -158,7 +158,11 @@ market_context:
     UNCERTAIN:      []
 
 ranking:
-  top_n: 50
+  top_n: 20
+  min_score_to_log: 70.0
+  rs_level_weight: 0.70
+  rs_trend_weight: 0.30
+  rs_leaders_n: 10
   opportunity_scoring:
     trend_weight:      0.30
     momentum_weight:   0.25
@@ -174,8 +178,8 @@ ranking:
 filters:
   history:
     min_bars:             300
-    max_gap_days:         5
-    max_stale_days:       3
+    max_gap_days:         7
+    max_stale_days:       7
     gap_lookback_days:    90
 
   price:
@@ -250,15 +254,107 @@ breadth_engine:
   emerging_weight:       0.40    # weight for unconfirmed (raw) signals
 
 # ── Sector Engine ─────────────────────────────────────────────
+# sector_engine:
+#   leading_threshold: 60.0
+#   lagging_threshold: 40.0
+
 sector_engine:
-  leading_threshold: 60.0
-  lagging_threshold: 40.0
+  leading_threshold:    0.65
+  leading_bull_pct:     55.0
+  strong_threshold:     0.50
+  neutral_threshold:    0.38
+  weakening_threshold:  0.25
+  top_n_log:            5
+  bottom_n_log:         5
+  min_sector_stocks:    5
+
 
 # ── Strategy Router ───────────────────────────────────────────
 strategy_router:
-  absolute_min_quality:      0.30
-  absolute_min_confidence:   0.30
-  min_quality_for_full_size: 0.70
+  # Baseline quality / confidence floors (overridden per-strategy per-market
+  # by the _STRATEGY_GATES table in router.py — these are the absolute minimums)
+  min_quality_for_trade:     0.36
+  min_confidence_for_trade:  0.46
+  min_quality_for_full_size: 0.65
+ 
+  # Breadth states that cap PSM (EXTREME_DOWN also hard-blocks MOMENTUM)
   adverse_breadth_states:
     - EXTREME_DOWN
     - CONTRACTING
+
+# Composite opportunity score weights.
+  # Must sum to 1.0 — the engine normalises automatically if they don't.
+  #
+  # Calibration guidance:
+  #   quality + trend are the two most reliable forward signals → 20% each.
+  #   sector_strength is the best market-context signal → 15%.
+  #   momentum adds conviction but overlaps with trend → 15%.
+  #   breadth, market_alignment, stability each at 10% — important but
+  #   they shift less frequently than the stock-level signals.
+  #   rs_score is set to 0 by default because rs_3m is often unavailable
+  #   for stocks without benchmark data. Set to 0.05–0.10 if you have
+  #   reliable RS data for your full universe.
+  composite_weights:
+    trend:             0.20
+    momentum:          0.15
+    quality:           0.20
+    sector_strength:   0.15
+    breadth_alignment: 0.03
+    market_alignment:  0.15
+    stability:         0.02
+    rs_score:          0.10
+
+
+market_alignment_matrix:
+    BULLISH_TREND:
+      TREND_UP:       1.00
+      MOMENTUM:       0.90
+      BREAKOUT_SETUP: 1.00
+      RANGE:          0.40
+      QUIET:          0.30
+      VOLATILE:       0.20
+      TREND_DOWN:     0.00
+      UNCERTAIN:      0.50
+ 
+    BEARISH_TREND:
+      TREND_DOWN:     1.00
+      RANGE:          0.50
+      QUIET:          0.40
+      VOLATILE:       0.30
+      TREND_UP:       0.30
+      MOMENTUM:       0.20
+      BREAKOUT_SETUP: 0.20
+      UNCERTAIN:      0.50
+ 
+    SIDEWAYS:
+      RANGE:          1.00
+      QUIET:          0.70
+      TREND_UP:       0.50
+      MOMENTUM:       0.40
+      BREAKOUT_SETUP: 0.30
+      TREND_DOWN:     0.30
+      VOLATILE:       0.20
+      UNCERTAIN:      0.50
+ 
+    VOLATILE:
+      VOLATILE:       1.00
+      TREND_UP:       0.40
+      MOMENTUM:       0.30
+      RANGE:          0.30
+      TREND_DOWN:     0.40
+      BREAKOUT_SETUP: 0.20
+      QUIET:          0.20
+      UNCERTAIN:      0.50
+ 
+    QUIET:
+      QUIET:          1.00
+      RANGE:          0.70
+      TREND_UP:       0.40
+      MOMENTUM:       0.30
+      BREAKOUT_SETUP: 0.30
+      TREND_DOWN:     0.30
+      VOLATILE:       0.10
+      UNCERTAIN:      0.50
+ 
+    UNCERTAIN:
+      _default: 0.50

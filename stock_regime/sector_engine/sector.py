@@ -1,254 +1,339 @@
 """
 stock_regime/sector_engine/sector.py
 ======================================
-Aggregates stock classifications by sector to produce sector-level
-trend, momentum, breadth, and relative strength metrics.
+SectorEngine — orchestrates the full sector intelligence pipeline.
 
-Sector mapping is loaded from a CSV file at:
-  data/sectors/<universe>_sectors.csv
+FIX 1 — Minimum Sector Sample Size Validation
+-----------------------------------------------
+persist() now writes sector_rankings.parquet (the LEADERBOARD file) using
+ONLY rankable sectors (excluded_from_ranking == False). sector_metrics.parquet
+and sector_states.parquet still record EVERY sector — including
+INSUFFICIENT_DATA ones — for audit/debugging purposes, but they carry the
+excluded_from_ranking flag and INSUFFICIENT_DATA state explicitly so no
+downstream consumer can mistake them for a real ranking signal.
 
-Expected CSV schema:
-  symbol, sector, industry
+Pipeline per run
+----------------
+1. SectorMap.get_sector()           → group stocks by sector
+2. metrics.compute_sector_metrics() → compute raw metrics per sector
+3. metrics.compute_composite_score()→ single [0,1] ranking score
+4. SectorClassifier.classify_batch()→ assign SectorState + ranks
+   (sectors below min_sector_stocks become INSUFFICIENT_DATA, rank=0)
+5. diagnostics.log_sector_summary() → structured logging
+6. persist()                        → three parquet files
 
-When no CSV is found, the engine falls back to an UNKNOWN sector
-for all symbols (graceful degradation — never fails the pipeline).
-
-Output per sector
------------------
-SectorSnapshot:
-  sector              : sector name
-  stock_count         : number of classified stocks in sector
-  trend_strength      : mean trend dimensional score
-  momentum_strength   : mean momentum dimensional score
-  pct_bullish         : % stocks TREND_UP or MOMENTUM
-  pct_bearish         : % stocks TREND_DOWN
-  avg_confidence      : mean smoothed_confidence
-  regime_distribution : {regime: count}
-  sector_state        : LEADING | NEUTRAL | LAGGING
+Public interface (unchanged)
+-----------------------------
+SectorEngine.compute()    → list[SectorSnapshot]
+SectorEngine.persist()    → dict[str, Path]
+SectorEngine.get_sector() → str (for strategy router / pipeline)
+SectorEngine.get_sector_context_map() → dict
+SectorEngine.get_symbol_sector_state() → str
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 
+from .classifier  import SectorClassifier
+from .diagnostics import build_sector_context_map, log_sector_summary
+from .metrics     import compute_composite_score, compute_sector_metrics
+from .models      import SectorSnapshot, SectorState
+from .sector_map  import SectorMap
+
 logger = logging.getLogger(__name__)
-
-_BULLISH_REGIMES = {"TREND_UP", "MOMENTUM"}
-_BEARISH_REGIMES = {"TREND_DOWN"}
-
-
-@dataclass
-class SectorSnapshot:
-    sector:             str
-    universe:           str
-    run_date:           date
-    stock_count:        int
-    trend_strength:     float
-    momentum_strength:  float
-    pct_bullish:        float
-    pct_bearish:        float
-    avg_confidence:     float
-    regime_distribution: dict = field(default_factory=dict)
-    sector_state:       str = "NEUTRAL"   # LEADING | NEUTRAL | LAGGING
-
-    def to_dict(self) -> dict:
-        return {
-            "sector":            self.sector,
-            "universe":          self.universe,
-            "run_date":          str(self.run_date),
-            "stock_count":       self.stock_count,
-            "trend_strength":    round(self.trend_strength,    4),
-            "momentum_strength": round(self.momentum_strength, 4),
-            "pct_bullish":       round(self.pct_bullish,       2),
-            "pct_bearish":       round(self.pct_bearish,       2),
-            "avg_confidence":    round(self.avg_confidence,    4),
-            "sector_state":      self.sector_state,
-        }
 
 
 class SectorEngine:
     """
-    Computes sector-level intelligence from stock regime classifications.
+    Full sector intelligence engine.
 
     Parameters
     ----------
-    sector_map_path : str | Path | None
-        Path to a CSV with columns: symbol, sector [, industry].
-        When None or missing, all symbols map to "UNKNOWN".
-    leading_threshold : float
-        pct_bullish above this → sector is LEADING.
-    lagging_threshold : float
-        pct_bearish above this → sector is LAGGING.
+    sector_map :
+        Pre-built SectorMap instance.
+    classifier :
+        Pre-built SectorClassifier instance (carries min_sector_stocks).
+    top_n_log :
+        How many top sectors to log.
+    bottom_n_log :
+        How many bottom sectors to log.
     """
 
     def __init__(
         self,
-        sector_map_path:    Optional[str | Path] = None,
-        leading_threshold:  float = 60.0,
-        lagging_threshold:  float = 40.0,
+        sector_map:   SectorMap,
+        classifier:   SectorClassifier,
+        top_n_log:    int = 5,
+        bottom_n_log: int = 5,
     ) -> None:
-        self.leading_thr  = leading_threshold
-        self.lagging_thr  = lagging_threshold
-        self._sector_map: dict[str, str] = {}   # symbol → sector
-        if sector_map_path:
-            self._load_map(Path(sector_map_path))
+        self._map        = sector_map
+        self._classifier = classifier
+        self.top_n_log   = top_n_log
+        self.bottom_n_log= bottom_n_log
+        self._last_snapshots: list[SectorSnapshot] = []
+
+        cov = sector_map.coverage()
+        logger.info(
+            "SectorEngine ready: %d symbols mapped → %d sectors. "
+            "min_sector_stocks=%d.",
+            cov["total_mapped"], cov["unique_sectors"],
+            classifier.min_sector_stocks,
+        )
+
+    # ──────────────────────────────────────────────────────────────
+    #  Factory
+    # ──────────────────────────────────────────────────────────────
 
     @classmethod
-    def from_config(cls, config, universe: str, project_root: Path) -> "SectorEngine":
-        """Build from config, looking for data/sectors/<universe>_sectors.csv."""
-        map_path = project_root / "data" / "sectors" / f"{universe.lower()}_sectors.csv"
-        sc = getattr(config, "sector_engine", None)
+    def from_config(
+        cls,
+        config,
+        universe:     str,
+        project_root: Path,
+    ) -> "SectorEngine":
+        """Build a SectorEngine from config + CSV at data/sectors/<universe>_sectors.csv."""
+        sector_map  = SectorMap.from_project_root(project_root, universe)
+        classifier  = SectorClassifier.from_config(config)
+        sc          = getattr(config, "sector_engine", None)
         return cls(
-            sector_map_path   = map_path if map_path.exists() else None,
-            leading_threshold = float(getattr(sc, "leading_threshold",  60.0) if sc else 60.0),
-            lagging_threshold = float(getattr(sc, "lagging_threshold",  40.0) if sc else 40.0),
+            sector_map   = sector_map,
+            classifier   = classifier,
+            top_n_log    = int(getattr(sc, "top_n_log",    5) if sc else 5),
+            bottom_n_log = int(getattr(sc, "bottom_n_log", 5) if sc else 5),
         )
+
+    # ──────────────────────────────────────────────────────────────
+    #  Primary API
+    # ──────────────────────────────────────────────────────────────
 
     def compute(
         self,
-        stable_results: list,       # list[StableRegimeResult]
+        stable_results: list,               # list[StableRegimeResult]
+        quality_scores: list,               # list[QualityScore]
         universe:       str,
         run_date:       Optional[date] = None,
     ) -> list[SectorSnapshot]:
-        """Compute one SectorSnapshot per sector found in stable_results."""
+        """
+        Compute full sector intelligence from today's classified stocks.
+
+        Returns
+        -------
+        list[SectorSnapshot]
+            Rankable sectors first (rank 1..N, sorted by composite_score),
+            followed by INSUFFICIENT_DATA sectors (rank=0, alphabetical).
+        """
         run_date = run_date or date.today()
         valid    = [r for r in stable_results if r.is_valid()]
 
-        # Group by sector
-        groups: dict[str, list] = {}
+        quality_map: dict[str, float] = {
+            q.symbol: q.quality_score for q in quality_scores
+        }
+
+        sector_groups: dict[str, list] = {}
+        unmapped_count = 0
         for r in valid:
-            sector = self._sector_map.get(r.symbol, "UNKNOWN")
-            groups.setdefault(sector, []).append(r)
+            sector = self._map.get_sector(r.symbol)
+            if sector == "UNKNOWN":
+                unmapped_count += 1
+            sector_groups.setdefault(sector, []).append(r)
 
-        snapshots = []
-        for sector, results in sorted(groups.items()):
-            snap = self._compute_sector(sector, universe, run_date, results)
-            snapshots.append(snap)
-
-        # Log sector summary
-        logger.info("SectorEngine [%s]: %d sectors computed", universe, len(snapshots))
-        for s in sorted(snapshots, key=lambda x: -x.trend_strength)[:5]:
-            logger.info(
-                "  %-20s  state=%-8s  trend=%.2f  mom=%.2f  bull=%.0f%%",
-                s.sector, s.sector_state,
-                s.trend_strength, s.momentum_strength, s.pct_bullish,
+        if unmapped_count > 0:
+            logger.debug(
+                "%d stocks mapped to UNKNOWN sector in '%s'. "
+                "Add them to data/sectors/%s_sectors.csv to improve coverage.",
+                unmapped_count, universe, universe.lower(),
             )
 
+        metrics_list = []
+        composite_map: dict[str, float] = {}
+        for sector, members in sector_groups.items():
+            m = compute_sector_metrics(
+                sector         = sector,
+                universe       = universe,
+                run_date       = run_date,
+                stable_results = members,
+                quality_map    = quality_map,
+            )
+            if m is not None:
+                score = compute_composite_score(m)
+                metrics_list.append(m)
+                composite_map[sector] = score
+
+        # classify_batch() applies the min_sector_stocks gate and assigns
+        # ranks ONLY among sectors that pass it.
+        snapshots = self._classifier.classify_batch(metrics_list, composite_map)
+
+        log_sector_summary(
+            snapshots  = snapshots,
+            universe   = universe,
+            run_date   = run_date,
+            top_n      = self.top_n_log,
+            bottom_n   = self.bottom_n_log,
+        )
+
+        self._last_snapshots = snapshots
         return snapshots
+
+    def get_sector(self, symbol: str) -> str:
+        """Return sector for a symbol (UNKNOWN if not mapped)."""
+        return self._map.get_sector(symbol)
+
+    def get_sector_context_map(self) -> dict[str, dict]:
+        """
+        Return a router/ranking-ready dict of sector context.
+        Only includes sectors with is_actionable() == True, i.e. sectors
+        that are NOT INSUFFICIENT_DATA and NOT excluded_from_ranking.
+        """
+        return build_sector_context_map(self._last_snapshots)
+
+    def get_symbol_sector_state(self, symbol: str) -> str:
+        """
+        Return the sector state for a given symbol.
+
+        Symbols belonging to an INSUFFICIENT_DATA sector are not present
+        in the context map (it was filtered by is_actionable()), so this
+        naturally falls back to NEUTRAL — the sector neither boosts nor
+        penalises routing/ranking decisions when its sample size is too
+        small to trust.
+        """
+        sector = self._map.get_sector(symbol)
+        ctx    = self.get_sector_context_map()
+        return ctx.get(sector, {}).get("state", SectorState.NEUTRAL.value)
+
+    def get_excluded_sectors(self) -> list[SectorSnapshot]:
+        """
+        Return all sectors currently excluded from ranking due to
+        insufficient sample size. Useful for dashboards / alerts that
+        want to surface "N sectors have too few stocks mapped".
+        """
+        return [s for s in self._last_snapshots if s.excluded_from_ranking]
+
+    # ──────────────────────────────────────────────────────────────
+    #  Persistence
+    # ──────────────────────────────────────────────────────────────
 
     def persist(
         self,
         snapshots:  list[SectorSnapshot],
         output_dir: str | Path,
         append:     bool = True,
-    ) -> Optional[Path]:
+    ) -> dict[str, Path]:
+        """
+        Persist three parquet files to output/sectors/:
+
+        sector_metrics.parquet
+            EVERY sector, including INSUFFICIENT_DATA ones — full audit trail.
+        sector_states.parquet
+            EVERY sector's state + rank + composite_score + excluded flag.
+        sector_rankings.parquet
+            LEADERBOARD — ONLY rankable sectors (excluded_from_ranking=False).
+            This is the file a dashboard or "top sectors" view should read.
+
+        Returns
+        -------
+        dict[str, Path]
+            Keys: "metrics", "states", "rankings"
+        """
         if not snapshots:
-            return None
+            return {}
+
         out = Path(output_dir) / "sectors"
         out.mkdir(parents=True, exist_ok=True)
+        saved: dict[str, Path] = {}
+
         universe = snapshots[0].universe
-        path     = out / f"{universe.lower()}_sectors.parquet"
 
-        new_df = pd.DataFrame([s.to_dict() for s in snapshots])
-        if append and path.exists():
-            existing = pd.read_parquet(path)
-            combined = pd.concat([existing, new_df], ignore_index=True)
-            combined.drop_duplicates(
-                subset=["sector", "universe", "run_date"], keep="last", inplace=True
-            )
-            combined.to_parquet(path, engine="pyarrow", compression="snappy", index=False)
-        else:
-            new_df.to_parquet(path, engine="pyarrow", compression="snappy", index=False)
+        # ── sector_metrics.parquet — full audit trail, all sectors ──
+        metrics_rows = [s.metrics.to_dict() for s in snapshots]
+        saved["metrics"] = self._write_parquet(
+            pd.DataFrame(metrics_rows),
+            out / "sector_metrics.parquet",
+            dedup_cols=["sector", "universe", "run_date"],
+            append=append,
+        )
 
-        logger.info("Sectors persisted [%s] → '%s'.", universe, path)
-        return path
+        # ── sector_states.parquet — full audit trail, all sectors ───
+        state_rows = [
+            {
+                "sector":                s.sector,
+                "universe":              s.universe,
+                "run_date":              str(s.run_date),
+                "state":                 s.state.value,
+                "rank":                  s.rank,
+                "composite_score":       s.composite_score,
+                "stock_count":           s.stock_count,
+                "excluded_from_ranking": s.excluded_from_ranking,
+            }
+            for s in snapshots
+        ]
+        saved["states"] = self._write_parquet(
+            pd.DataFrame(state_rows),
+            out / "sector_states.parquet",
+            dedup_cols=["sector", "universe", "run_date"],
+            append=append,
+        )
 
-    def get_sector(self, symbol: str) -> str:
-        """Return the sector for a symbol (UNKNOWN if not mapped)."""
-        return self._sector_map.get(symbol, "UNKNOWN")
+        # ── sector_rankings.parquet — LEADERBOARD: rankable only ────
+        rankable = [s for s in snapshots if not s.excluded_from_ranking]
+        ranking_rows = [
+            {
+                "sector":                  s.sector,
+                "universe":                s.universe,
+                "run_date":                str(s.run_date),
+                "rank":                    s.rank,
+                "state":                   s.state.value,
+                "composite_score":         s.composite_score,
+                "pct_bullish":             s.metrics.pct_bullish,
+                "pct_above_ema200":        s.metrics.pct_above_ema200,
+                "avg_trend_score":         s.metrics.avg_trend_score,
+                "avg_momentum_score":      s.metrics.avg_momentum_score,
+                "avg_quality_score":       s.metrics.avg_quality_score,
+                "avg_rs_3m":               s.metrics.avg_rs_3m,
+                "momentum_participation":  s.metrics.momentum_participation,
+                "stock_count":             s.stock_count,
+            }
+            for s in sorted(rankable, key=lambda x: x.rank)
+        ]
+        saved["rankings"] = self._write_parquet(
+            pd.DataFrame(ranking_rows),
+            out / "sector_rankings.parquet",
+            dedup_cols=["sector", "universe", "run_date"],
+            append=append,
+        )
+
+        excluded_count = len(snapshots) - len(rankable)
+        logger.info(
+            "Sector Intelligence [%s]: %d sectors persisted "
+            "(%d rankable in leaderboard, %d excluded as INSUFFICIENT_DATA) → '%s'.",
+            universe, len(snapshots), len(rankable), excluded_count, out,
+        )
+        return saved
 
     # ──────────────────────────────────────────────────────────────
     #  Private helpers
     # ──────────────────────────────────────────────────────────────
 
-    def _compute_sector(
-        self, sector: str, universe: str, run_date: date, results: list
-    ) -> SectorSnapshot:
-        n     = max(len(results), 1)
-        regimes = [
-            r.stable_regime.value if hasattr(r, "stable_regime")
-            else r.stock_regime.value
-            for r in results
-        ]
-        n_bull = sum(1 for rg in regimes if rg in _BULLISH_REGIMES)
-        n_bear = sum(1 for rg in regimes if rg in _BEARISH_REGIMES)
-
-        pct_bull = n_bull / n * 100
-        pct_bear = n_bear / n * 100
-
-        # Mean dimensional scores
-        trend_scores = [
-            r.dimensional_scores.trend for r in results
-            if r.dimensional_scores is not None
-        ]
-        mom_scores = [
-            r.dimensional_scores.momentum for r in results
-            if r.dimensional_scores is not None
-        ]
-        confs = [
-            r.smoothed_confidence if hasattr(r, "smoothed_confidence")
-            else r.confidence
-            for r in results
-        ]
-
-        trend_strength    = sum(trend_scores) / len(trend_scores) if trend_scores else 0.0
-        momentum_strength = sum(mom_scores)   / len(mom_scores)   if mom_scores   else 0.0
-        avg_conf          = sum(confs)         / len(confs)        if confs        else 0.0
-
-        # Regime distribution
-        dist: dict[str, int] = {}
-        for rg in regimes:
-            dist[rg] = dist.get(rg, 0) + 1
-
-        # State
-        if pct_bull > self.leading_thr:
-            state = "LEADING"
-        elif pct_bear > self.lagging_thr:
-            state = "LAGGING"
+    @staticmethod
+    def _write_parquet(
+        new_df:    pd.DataFrame,
+        path:      Path,
+        dedup_cols: list[str],
+        append:    bool,
+    ) -> Path:
+        if append and path.exists():
+            existing = pd.read_parquet(path)
+            for col in new_df.columns:
+                if col not in existing.columns:
+                    existing[col] = None
+            combined = pd.concat([existing, new_df], ignore_index=True)
+            combined.drop_duplicates(subset=dedup_cols, keep="last", inplace=True)
+            combined.to_parquet(path, engine="pyarrow", compression="snappy", index=False)
         else:
-            state = "NEUTRAL"
-
-        return SectorSnapshot(
-            sector             = sector,
-            universe           = universe,
-            run_date           = run_date,
-            stock_count        = len(results),
-            trend_strength     = round(trend_strength,    4),
-            momentum_strength  = round(momentum_strength, 4),
-            pct_bullish        = round(pct_bull,          2),
-            pct_bearish        = round(pct_bear,          2),
-            avg_confidence     = round(avg_conf,          4),
-            regime_distribution= dist,
-            sector_state       = state,
-        )
-
-    def _load_map(self, path: Path) -> None:
-        if not path.exists():
-            logger.debug("Sector map not found at '%s' — using UNKNOWN.", path)
-            return
-        try:
-            df = pd.read_csv(path)
-            df.columns = [c.lower().strip() for c in df.columns]
-            if "symbol" not in df.columns or "sector" not in df.columns:
-                logger.warning("Sector CSV missing 'symbol' or 'sector' column.")
-                return
-            self._sector_map = dict(zip(df["symbol"], df["sector"]))
-            logger.info("Loaded %d sector mappings from '%s'.", len(self._sector_map), path)
-        except Exception as exc:
-            logger.warning("Could not load sector map '%s': %s", path, exc)
+            new_df.to_parquet(path, engine="pyarrow", compression="snappy", index=False)
+        return path
