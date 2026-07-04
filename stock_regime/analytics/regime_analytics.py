@@ -245,7 +245,20 @@ class RegimeAnalytics:
         if not self._path.exists():
             return pd.DataFrame()
         df = pd.read_parquet(self._path)
-        df["run_date"] = pd.to_datetime(df["run_date"]).dt.date
+
+        if "date" in df.columns and "run_date" not in df.columns:
+            df["run_date"] = pd.to_datetime(df["date"]).dt.date
+        elif "run_date" in df.columns:
+            df["run_date"] = pd.to_datetime(df["run_date"]).dt.date
+        else:
+            return pd.DataFrame()
+
+        if "stable_regime" not in df.columns and "regime" in df.columns:
+            df["stable_regime"] = df["regime"]
+
+        if "market" not in df.columns:
+            df["market"] = universe
+
         df = df[
             (df["market"] == universe) &
             (df["run_date"] <= as_of)

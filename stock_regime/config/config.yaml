@@ -231,6 +231,16 @@ stability:
   persistence_window:      5
   regime_switch_threshold: 0.55
 
+# ── Historical regime reconstruction ─────────────────────────
+analytics:
+  historical_regime:
+    enabled: true
+    rebuild: false
+    lookback_days: 90
+    warmup_days: 250
+    persist_history: true
+    output_file: "output/historical_regimes/historical_regime_series.parquet"
+
 # ── Opportunity Quality Engine ────────────────────────────────
 quality_engine:
   weights:

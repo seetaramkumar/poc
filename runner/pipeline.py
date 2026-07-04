@@ -403,7 +403,15 @@ class AlgoTradingPipeline:
 
         # ── 14. Analytics ─────────────────────────────────────────────
         if persist:
-            self._run_analytics(universe_name, output_root)
+            self._run_analytics(
+                universe_name,
+                output_root,
+                stable_results,
+                quality_scores,
+                self._run_date,
+                accepted_data=clean_data,
+                benchmark_df=benchmark_df,
+            )
 
         if failed_symbols:
             logger.warning("%d failed in '%s': %s",
@@ -552,17 +560,90 @@ class AlgoTradingPipeline:
                             universe, col, df[col].mean(), df[col].std(),
                             df[col].quantile(0.90))
 
-    def _run_analytics(self, universe, output_root):
+    def _run_analytics(
+        self,
+        universe,
+        output_root,
+        stable_results,
+        quality_scores,
+        run_date,
+        accepted_data: Optional[dict[str, pd.DataFrame]] = None,
+        benchmark_df: Optional[pd.DataFrame] = None,
+    ):
+        from stock_regime.analytics.historical_regime import HistoricalRegimeEngine
         from stock_regime.analytics.regime_analytics import RegimeAnalytics
+        from stock_regime.analytics.regime_diagnostics import RegimeDiagnosticsEngine
+
         hp = Path(output_root) / "regime_history" / "regime_history.parquet"
-        if not hp.exists(): return
+
+        # Build historical regime series from OHLCV data, not from execution history
+        historical_series_path = None
+        analytics_cfg = getattr(self._stock_engine.config, "analytics", None)
+        historical_cfg = getattr(analytics_cfg, "historical_regime", None) if analytics_cfg is not None else None
+        if getattr(historical_cfg, "enabled", True) and accepted_data:
+            try:
+                hist_engine = HistoricalRegimeEngine(
+                    config_path=None,
+                    output_dir=output_root,
+                    lookback_days=int(getattr(historical_cfg, "lookback_days", 90) or 90),
+                    persist_history=bool(getattr(historical_cfg, "persist_history", True)),
+                    output_file=getattr(historical_cfg, "output_file", "output/historical_regimes/historical_regime_series.parquet"),
+                )
+                hist_series = hist_engine.build_series_from_histories(
+                    symbol_histories=accepted_data,
+                    benchmark_history=benchmark_df,
+                    symbols=list(accepted_data.keys()),
+                    market_label=universe,
+                )
+                historical_series_path = str(hist_engine.output_path)
+                logger.info(
+                    "Historical regime reconstruction for '%s': %d rows -> %s",
+                    universe,
+                    len(hist_series),
+                    historical_series_path,
+                )
+            except Exception as exc:
+                logger.warning("HistoricalRegimeEngine failed for '%s': %s", universe, exc)
+
+        # Existing regime analytics (kept for backward compatibility)
+        if hp.exists():
+            try:
+                rpt = RegimeAnalytics(hp, min_episode_bars=2).compute(
+                    universe, as_of_date=run_date
+                )
+                RegimeAnalytics(hp).persist(rpt, output_root)
+            except Exception as exc:
+                logger.warning("RegimeAnalytics failed for '%s': %s", universe, exc)
+
+        # Diagnostics use the reconstructed historical regime series
+        history_path = historical_series_path or str(hp)
         try:
-            rpt = RegimeAnalytics(hp, min_episode_bars=2).compute(
-                universe, as_of_date=self._run_date
+            diag = RegimeDiagnosticsEngine(history_path=history_path)
+            diag.load_history(history_path)
+            diag.set_quality_scores(quality_scores)
+
+            osc_metrics = diag.compute_oscillation_metrics(
+                stable_results, universe, run_date=run_date
             )
-            RegimeAnalytics(hp).persist(rpt, output_root)
+            transitions = diag.compute_transition_matrix()
+            stability = diag.compute_regime_stability()
+
+            top_osc = sorted(
+                osc_metrics,
+                key=lambda m: (m.oscillation_count_30d, m.regime_changes_30d),
+                reverse=True,
+            )[:50]
+
+            summary = diag.compute_oscillation_summary(
+                osc_metrics, transitions, stability, universe
+            )
+
+            diag.persist(osc_metrics, top_osc, transitions, stability, summary,
+                        output_root, run_date=run_date)
+            RegimeDiagnosticsEngine.log_summary(summary, top_osc, stability)
+
         except Exception as exc:
-            logger.warning("Analytics failed for '%s': %s", universe, exc)
+            logger.warning("RegimeDiagnostics failed for '%s': %s", universe, exc)
 
     def _empty_result(self, universe, market_result, failed_symbols, benchmark_df,
                       symbols_loaded=0, accepted_count=0, excluded_count=0, rejected_count=0):

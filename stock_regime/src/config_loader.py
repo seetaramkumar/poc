@@ -191,6 +191,7 @@ class StockEngineConfig:
         self.breadth_engine    = _NS(raw["breadth_engine"])    if "breadth_engine"    in raw else _NS({})
         self.sector_engine     = _NS(raw["sector_engine"])     if "sector_engine"     in raw else _NS({})
         self.strategy_router   = _NS(raw["strategy_router"])   if "strategy_router"   in raw else _NS({})
+        self.analytics         = _NS(raw["analytics"])         if "analytics"         in raw else _NS({})
 
     # ── Convenience accessors ──────────────────────────────────────────
 
