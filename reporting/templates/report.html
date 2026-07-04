@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Market Intelligence Report - {{ run_date }}</title>
+  <style>{{ style_css }}</style>
+</head>
+<body class="bg-dark text-light">
+<nav class="navbar navbar-expand-lg navbar-dark sticky-top">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="#">Signal Generator</a>
+    <span class="navbar-text">Daily Market Intelligence Report · {{ run_date }}</span>
+  </div>
+</nav>
+
+<div class="container py-4">
+  <section class="mb-4">
+    <h1 class="display-6 fw-bold">Executive Summary</h1>
+    <p class="text-muted">A professional snapshot of the latest market regime, breadth, quality, and routing state.</p>
+    <div class="row g-3">
+      <div class="col-md-3"><div class="card glass-card p-3"><h6>Market Regime</h6><div class="display-6">{{ summary.market_regime }}</div></div></div>
+      <div class="col-md-3"><div class="card glass-card p-3"><h6>Confidence</h6><div class="display-6">{{ "%.3f"|format(summary.confidence) }}</div></div></div>
+      <div class="col-md-3"><div class="card glass-card p-3"><h6>Breadth State</h6><div class="display-6">{{ summary.breadth_state }}</div></div></div>
+      <div class="col-md-3"><div class="card glass-card p-3"><h6>Market Health</h6><div class="display-6">{{ summary.market_health }}</div></div></div>
+    </div>
+  </section>
+
+  <section class="mb-4">
+    <div class="row g-3">
+      <div class="col-lg-8">
+        <div class="card glass-card p-3">
+          <h5 class="card-title">Market Overview</h5>
+          {{ regime_chart|safe }}
+        </div>
+      </div>
+      <div class="col-lg-4">
+        <div class="card glass-card p-3">
+          <h5 class="card-title">Breadth Snapshot</h5>
+          {{ breadth_chart|safe }}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mb-4">
+    <div class="card glass-card p-3">
+      <h5 class="card-title">Sector Intelligence</h5>
+      {{ sector_chart|safe }}
+      <div class="table-responsive mt-3">
+        <table class="table table-dark table-sm">
+          <thead><tr><th>Sector</th><th>Score</th></tr></thead>
+          <tbody>
+            {% for row in sector_table.head(10).itertuples(index=False) %}
+            <tr><td>{{ row[0] }}</td><td>{{ row[1] }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="mb-4">
+    <div class="card glass-card p-3">
+      <h5 class="card-title">Strategy Router</h5>
+      <div class="row g-3">
+        <div class="col-lg-6">{{ opportunity_chart|safe }}</div>
+        <div class="col-lg-6">{{ quality_hist|safe }}</div>
+      </div>
+      <div class="table-responsive mt-3">
+        <table class="table table-dark table-sm">
+          <thead><tr><th>Strategy</th><th>Count</th></tr></thead>
+          <tbody>
+            {% for row in strategy_breakdown.itertuples(index=False) %}
+            <tr><td>{{ row[0] }}</td><td>{{ row[1] }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="mb-4">
+    <div class="card glass-card p-3">
+      <h5 class="card-title">Opportunities</h5>
+      <div class="table-responsive">
+        <table class="table table-dark table-sm">
+          <thead><tr><th>Ticker</th><th>Score</th><th>Strategy</th><th>Sector</th></tr></thead>
+          <tbody>
+            {% for row in opportunity_table.head(20).itertuples(index=False) %}
+            <tr><td>{{ row[0] }}</td><td>{{ row[1] }}</td><td>{{ row[2] if row[2] is not none else 'n/a' }}</td><td>{{ row[3] if row[3] is not none else 'n/a' }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="mb-4">
+    <div class="card glass-card p-3">
+      <h5 class="card-title">Quality Analysis</h5>
+      <p>Average quality: {{ quality_summary.average }} · Median quality: {{ quality_summary.median }}</p>
+      {{ quality_hist|safe }}
+    </div>
+  </section>
+
+  <section class="mb-4">
+    <div class="card glass-card p-3">
+      <h5 class="card-title">System Health</h5>
+      <p>Parquet files: {{ system_health.parquet_files }} · Combined size: {{ system_health.file_sizes }} MB · Rejections: {{ system_health.rejections }}</p>
+      <ul>
+        {% for file in parquet_files %}
+        <li>{{ file.relative_path }} ({{ file.size_mb }} MB)</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </section>
+</div>
+</body>
+</html>
